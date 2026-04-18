@@ -1,0 +1,1004 @@
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import shutil
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+import torch
+import yaml
+
+from .envs.maze_2d import Bounds2D, Maze2DEnv
+from .evaluator.metrics import EvalMetrics, evaluate_methods
+from .evaluator.plotter import save_field_and_paths_plot, save_field_quiver_plot
+from .solvers.factored_nn import FactoredTimeNN, VanillaTimeNN
+from .solvers.physics_loss import (
+    loss_gate_forcing,
+    loss_curl,
+    loss_monotonicity,
+    obstacle_loss,
+    physics_loss,
+    start_bc_loss,
+    upwind_physics_loss,
+)
+from .solvers.rsa_engine import RSAEngine, RSAResult, extract_gateway_segment, sample_gate_band
+from .utils.sampler import apply_sdf_surface_boost, sample_adaptive_xy
+
+
+def _set_seed(seed: int) -> np.random.Generator:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    return np.random.default_rng(seed)
+
+
+def _load_cfg(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _archive_root(cfg: Dict[str, Any]) -> Path:
+    root = _project_root()
+    archive_root = cfg.get("eval", {}).get("archive_root", "test_result")
+    return (root / str(archive_root)).resolve()
+
+
+def _date_stamp(cfg: Dict[str, Any]) -> str:
+    stamp = cfg.get("eval", {}).get("archive_date")
+    if stamp is not None and str(stamp).strip():
+        return str(stamp).strip()
+    return dt.date.today().isoformat()
+
+
+def _next_run_dir(cfg: Dict[str, Any], create: bool = True) -> Path:
+    date_dir = _archive_root(cfg) / _date_stamp(cfg)
+    if create:
+        date_dir.mkdir(parents=True, exist_ok=True)
+    run_dirs = sorted([p for p in date_dir.glob("run_*") if p.is_dir()])
+    next_idx = len(run_dirs) + 1
+    run_dir = date_dir / f"run_{next_idx:02d}"
+    if create:
+        run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def _latest_run_dir(cfg: Dict[str, Any], create_if_missing: bool = False) -> Path | None:
+    date_dir = _archive_root(cfg) / _date_stamp(cfg)
+    if not date_dir.exists():
+        return _next_run_dir(cfg, create=True) if create_if_missing else None
+    run_dirs = sorted([p for p in date_dir.glob("run_*") if p.is_dir()])
+    if not run_dirs:
+        return _next_run_dir(cfg, create=True) if create_if_missing else None
+    return run_dirs[-1]
+
+
+def _copy_if_exists(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+
+def _copy_tree_if_exists(src: Path, dst: Path) -> None:
+    if not src.exists():
+        return
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(src, dst)
+
+
+def _archive_outputs(cfg: Dict[str, Any], out_dir: str) -> Path:
+    out_path = Path(out_dir).resolve()
+    run_dir = _next_run_dir(cfg, create=True)
+    benchmark_dir = run_dir / "benchmark"
+    field_dir = run_dir / "field_visualizations"
+    reports_dir = run_dir / "reports"
+    benchmark_dir.mkdir(parents=True, exist_ok=True)
+    field_dir.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    _copy_if_exists(out_path / "results.json", benchmark_dir / "results.json")
+    _copy_if_exists(out_path / "benchmark_metrics.png", benchmark_dir / "benchmark_metrics.png")
+
+    for img in sorted(out_path.glob("fields*.png")):
+        _copy_if_exists(img, field_dir / img.name)
+
+    _copy_tree_if_exists(out_path / "report_plots", reports_dir / "report_plots")
+    return run_dir
+
+
+def _make_env(cfg: Dict[str, Any], device: torch.device) -> Maze2DEnv:
+    bcfg = cfg["env"]["bounds"]
+    bounds = Bounds2D(**bcfg)
+    name = cfg["env"]["name"]
+    common = dict(
+        bounds=bounds,
+        obstacle_inflation=float(cfg["env"].get("obstacle_inflation", 0.0)),
+        speed_free=float(cfg["rsa"].get("speed_free", 1.0)),
+        speed_obstacle=float(cfg["rsa"].get("speed_obstacle", 0.0)),
+        device=device,
+    )
+    if name == "u_maze":
+        p = cfg["env"]["u_maze"]
+        return Maze2DEnv.make_u_maze(
+            **common,
+            wall_thickness=float(p["wall_thickness"]),
+            inner_gap=float(p["inner_gap"]),
+            depth=float(p["depth"]),
+            center=tuple(p.get("center", [0.0, 0.0])),
+            rotation_deg=float(p.get("rotation_deg", 0.0)),
+        )
+    if name == "narrow_passage":
+        p = cfg["env"]["narrow_passage"]
+        return Maze2DEnv.make_narrow_passage(
+            **common,
+            passage_width=float(p["passage_width"]),
+            block_width=float(p["block_width"]),
+            block_height=float(p["block_height"]),
+        )
+    raise ValueError(f"Unknown env.name: {name}")
+
+
+def _grid_coords(bounds: Bounds2D, grid_size: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
+    h, w = int(grid_size[0]), int(grid_size[1])
+    xs = np.linspace(bounds.x_min, bounds.x_max, w, dtype=np.float32)
+    ys = np.linspace(bounds.y_min, bounds.y_max, h, dtype=np.float32)
+    return xs, ys
+
+
+def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask = mask.to(dtype=x.dtype)
+    denom = torch.mean(mask) + 1e-12
+    return torch.mean(x * mask) / denom
+
+
+def _interp_vec_bilinear(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    vx: np.ndarray,
+    vy: np.ndarray,
+    xy: np.ndarray,
+) -> np.ndarray:
+    x = xy[:, 0]
+    y = xy[:, 1]
+    w = xs.shape[0]
+    h = ys.shape[0]
+
+    x = np.clip(x, xs[0], xs[-1])
+    y = np.clip(y, ys[0], ys[-1])
+
+    j = np.searchsorted(xs, x) - 1
+    i = np.searchsorted(ys, y) - 1
+    j = np.clip(j, 0, w - 2)
+    i = np.clip(i, 0, h - 2)
+
+    x0 = xs[j]
+    x1 = xs[j + 1]
+    y0 = ys[i]
+    y1 = ys[i + 1]
+    tx = (x - x0) / (x1 - x0 + 1e-12)
+    ty = (y - y0) / (y1 - y0 + 1e-12)
+
+    def _interp(f: np.ndarray) -> np.ndarray:
+        f00 = f[i, j]
+        f10 = f[i, j + 1]
+        f01 = f[i + 1, j]
+        f11 = f[i + 1, j + 1]
+        fill = 0.0
+        f00 = np.where(np.isfinite(f00), f00, fill)
+        f10 = np.where(np.isfinite(f10), f10, fill)
+        f01 = np.where(np.isfinite(f01), f01, fill)
+        f11 = np.where(np.isfinite(f11), f11, fill)
+        f0 = f00 * (1 - tx) + f10 * tx
+        f1 = f01 * (1 - tx) + f11 * tx
+        return f0 * (1 - ty) + f1 * ty
+
+    out_x = _interp(vx)
+    out_y = _interp(vy)
+    return np.stack([out_x, out_y], axis=1).astype(np.float32)
+
+
+def _gate_boost_weight(
+    weight: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    gate_pts: np.ndarray,
+    radius: float,
+    boost: float,
+) -> np.ndarray:
+    w = weight.astype(np.float32, copy=True)
+    if gate_pts.size == 0:
+        return w
+    dx = float(xs[1] - xs[0]) if xs.shape[0] > 1 else 1.0
+    dy = float(ys[1] - ys[0]) if ys.shape[0] > 1 else 1.0
+    r_cells = int(np.ceil(float(radius) / max(1e-12, min(dx, dy))))
+    h, ww = w.shape
+
+    for p in gate_pts:
+        j0 = int(np.argmin(np.abs(xs - float(p[0]))))
+        i0 = int(np.argmin(np.abs(ys - float(p[1]))))
+        i1 = max(0, i0 - r_cells)
+        i2 = min(h, i0 + r_cells + 1)
+        j1 = max(0, j0 - r_cells)
+        j2 = min(ww, j0 + r_cells + 1)
+        w[i1:i2, j1:j2] *= 1.0 + float(boost)
+
+    return w.astype(np.float32)
+
+
+def _get_convergence_cfg(cfg: Dict[str, Any]) -> Tuple[float, int, int]:
+    tcfg = cfg.get("train", {})
+    ccfg = tcfg.get("convergence", {}) if isinstance(tcfg, dict) else {}
+    tol = float(ccfg.get("tol", 1e-3))
+    patience = int(ccfg.get("patience", 50))
+    check_every = int(ccfg.get("check_every", 1))
+    return tol, patience, check_every
+
+
+def sample_path_tube(
+    path_xy: np.ndarray,
+    radius: float,
+    num_samples: int,
+    rng: np.random.Generator,
+    env: Maze2DEnv,
+    device: torch.device,
+    lookahead: int = 25,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    path_xy = np.asarray(path_xy, dtype=np.float32)
+    if path_xy.ndim != 2 or path_xy.shape[1] != 2:
+        raise ValueError("path_xy must have shape [M,2].")
+    if path_xy.shape[0] < 2:
+        raise ValueError("path_xy must contain at least 2 points.")
+    lookahead = int(max(1, lookahead))
+
+    m = path_xy.shape[0]
+    idx = rng.integers(0, m, size=(int(num_samples),), endpoint=False)
+    base = path_xy[idx]
+
+    ang = rng.uniform(0.0, 2 * np.pi, size=(int(num_samples),)).astype(np.float32)
+    rad = np.sqrt(rng.uniform(0.0, 1.0, size=(int(num_samples),)).astype(np.float32)) * float(radius)
+    offset = np.stack([np.cos(ang) * rad, np.sin(ang) * rad], axis=1).astype(np.float32)
+    pts = (base + offset).astype(np.float32)
+
+    d2 = np.sum((pts[:, None, :] - path_xy[None, :, :]) ** 2, axis=-1)
+    nn_idx = np.argmin(d2, axis=1).astype(np.int32)
+    look_idx = np.minimum(nn_idx + lookahead, m - 1).astype(np.int32)
+    p_look = path_xy[look_idx]
+    d_look = (p_look - pts).astype(np.float32)
+    dn = np.linalg.norm(d_look, axis=1, keepdims=True) + 1e-12
+    d_look = (d_look / dn).astype(np.float32)
+
+    pts_t = torch.from_numpy(pts).to(device=device, dtype=torch.float32).requires_grad_(True)
+    sdf = env.sdf(pts_t)
+    if sdf.ndim == 2:
+        sdf = sdf[:, 0]
+    grad_sdf = torch.autograd.grad(sdf.sum(), pts_t, create_graph=False, retain_graph=False)[0]
+    n = grad_sdf / (torch.linalg.norm(grad_sdf, dim=-1, keepdim=True) + 1e-12)
+    d_look_t = torch.from_numpy(d_look).to(device=device, dtype=torch.float32)
+    dot = torch.sum(d_look_t * n, dim=-1, keepdim=True)
+    mask = dot < 0.0
+    d_proj = d_look_t - dot * n
+    d_proj = d_proj / (torch.linalg.norm(d_proj, dim=-1, keepdim=True) + 1e-12)
+    d_look_t = torch.where(mask, d_proj, d_look_t)
+    d_look = d_look_t.detach().cpu().numpy().astype(np.float32)
+
+    return pts, d_look, p_look
+
+
+def _train_rhp(
+    env: Maze2DEnv,
+    start_xy: Tuple[float, float],
+    goal_xy: Tuple[float, float],
+    rsa_guidance: RSAResult,
+    rsa_path_xy: np.ndarray,
+    gate_xy: np.ndarray,
+    d_target: np.ndarray,
+    gate_d_targets: np.ndarray,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    weight: np.ndarray,
+    cfg: Dict[str, Any],
+    rng: np.random.Generator,
+    device: torch.device,
+) -> Tuple[FactoredTimeNN, int, int]:
+    mcfg = cfg["model"]
+    tcfg = cfg["train"]
+    model = FactoredTimeNN(
+        start_xy=start_xy,
+        hidden_dim=int(mcfg["hidden_dim"]),
+        num_layers=int(mcfg["num_layers"]),
+        activation=str(mcfg.get("activation", "tanh")),
+        dist_eps=float(mcfg.get("dist_eps", 1e-6)),
+    ).to(device=device)
+
+    opt = torch.optim.Adam(model.parameters(), lr=float(tcfg["lr"]))
+    start_t = torch.tensor(start_xy, dtype=torch.float32, device=device)
+
+    tol, patience, check_every = _get_convergence_cfg(cfg)
+    ok_count = 0
+    converged_step = -1
+    train_steps = 0
+    ocfg = tcfg.get("obstacle", {}) if isinstance(tcfg, dict) else {}
+    sdf_band = float(ocfg.get("sdf_band", 0.05))
+    lambda_int = float(ocfg.get("lambda_int", 100.0))
+    lambda_grad = float(ocfg.get("lambda_grad", 10.0))
+    lambda_dir = float(ocfg.get("lambda_dir", 50.0))
+    lambda_vort = float(ocfg.get("lambda_vort", 20.0))
+    sdf_scale = float(ocfg.get("sdf_scale", 10.0))
+    lambda_obs = float(tcfg.get("lambda_obs", 1.0))
+    pcfg = tcfg.get("path_anchor", {}) if isinstance(tcfg, dict) else {}
+    lambda_path = float(pcfg.get("lambda_path", 20.0))
+    path_radius = float(pcfg.get("radius", 0.05))
+    path_batch = int(pcfg.get("batch_size", 512))
+    lambda_mono = float(pcfg.get("lambda_mono", 20.0))
+    lambda_phys_start = float(tcfg.get("lambda_phys_start", 0.1))
+    lambda_phys_end = float(tcfg.get("lambda_phys", 1.0))
+    phcfg = tcfg.get("physics", {}) if isinstance(tcfg, dict) else {}
+    physics_mode = str(phcfg.get("mode", "autograd")).lower()
+    fd_step = float(phcfg.get("fd_step", 0.01))
+
+    if rsa_path_xy.ndim != 2 or rsa_path_xy.shape[1] != 2:
+        raise ValueError("rsa_path_xy must have shape [M,2]")
+    rsa_path_xy = rsa_path_xy.astype(np.float32)
+    if rsa_path_xy.shape[0] < 2:
+        raise ValueError("rsa_path_xy must contain at least 2 points.")
+    tang = np.zeros_like(rsa_path_xy, dtype=np.float32)
+    tang[:-1] = rsa_path_xy[1:] - rsa_path_xy[:-1]
+    tang[-1] = tang[-2]
+    tang_norm = np.linalg.norm(tang, axis=1, keepdims=True) + 1e-12
+    tang = tang / tang_norm
+    goal_target = float(rsa_guidance.interpolate_t(np.asarray([goal_xy], dtype=np.float32))[0])
+    lambda_goal = float(tcfg.get("lambda_goal", 5.0))
+    lambda_path_dir = float(pcfg.get("lambda_dir", 10.0))
+    gcfg = tcfg.get("gate", {}) if isinstance(tcfg, dict) else {}
+    gate_sdf_band = float(gcfg.get("sdf_band", 0.03))
+    gate_radius = float(gcfg.get("radius", 0.07))
+    gate_batch = int(gcfg.get("batch_size", 512))
+    lambda_rsa_dir = float(gcfg.get("lambda_rsa_dir", 50.0))
+    gfcfg = tcfg.get("gate_forcing", {}) if isinstance(tcfg, dict) else {}
+    lambda_gate = float(gfcfg.get("lambda_gate", 150.0))
+    gate_force_radius = float(gfcfg.get("radius", 0.15))
+    gate_force_batch = int(gfcfg.get("batch_size", 512))
+
+    warmup_steps = int(tcfg.get("warmup_steps", 0))
+    batch_size = int(tcfg["batch_size"])
+
+    dx = float(xs[1] - xs[0]) if xs.shape[0] > 1 else 1.0
+    dy = float(ys[1] - ys[0]) if ys.shape[0] > 1 else 1.0
+    tgrid = rsa_guidance.t.astype(np.float32)
+    finite = np.isfinite(tgrid)
+    fill = float(np.max(tgrid[finite])) if np.any(finite) else 1.0
+    tgrid = np.where(finite, tgrid, fill)
+    dtdy, dtdx = np.gradient(tgrid, dy, dx)
+    dtdx = dtdx.astype(np.float32)
+    dtdy = dtdy.astype(np.float32)
+
+    with torch.no_grad():
+        sdf_path = env.sdf(torch.from_numpy(rsa_path_xy).to(device=device, dtype=torch.float32)).cpu().numpy()
+    gate_mask = (sdf_path >= 0.0) & (sdf_path < float(gate_sdf_band))
+    gate_pts = rsa_path_xy[gate_mask]
+    if gate_pts.shape[0] == 0:
+        gate_pts = rsa_path_xy
+    gate_xy = np.asarray(gate_xy, dtype=np.float32)
+    if gate_xy.ndim != 2 or gate_xy.shape[1] != 2 or gate_xy.shape[0] < 2:
+        gate_xy = gate_pts
+    d_target = np.asarray(d_target, dtype=np.float32).reshape(-1)
+    if d_target.shape[0] != 2:
+        d_target = np.asarray([1.0, 0.0], dtype=np.float32)
+    gate_d_targets = np.asarray(gate_d_targets, dtype=np.float32)
+    if gate_d_targets.ndim != 2 or gate_d_targets.shape != (gate_xy.shape[0], 2):
+        gate_d_targets = np.tile(d_target.reshape(1, 2), (gate_xy.shape[0], 1)).astype(np.float32)
+
+    ttcfg = tcfg.get("topology_tunneling", {}) if isinstance(tcfg, dict) else {}
+    tube_radius = float(ttcfg.get("tube_radius", 0.1))
+    tube_samples = int(ttcfg.get("tube_samples", 256))
+    lambda_mono_gate = float(ttcfg.get("lambda_mono", 200.0))
+    lambda_curl_gate = float(ttcfg.get("lambda_curl", 20.0))
+    alpha_gate = float(ttcfg.get("alpha", 0.6))
+    lambda_gate_value = float(ttcfg.get("lambda_value", 200.0))
+    lambda_lookahead_drop = float(ttcfg.get("lambda_lookahead", 25.0))
+    lookahead_drop_scale = float(ttcfg.get("drop_scale", 0.75))
+    lambda_gate_drop = float(ttcfg.get("lambda_gate_drop", 120.0))
+    gate_drop_scale = float(ttcfg.get("gate_drop_scale", 0.90))
+    gate_drop_step_scale = float(ttcfg.get("gate_drop_step_scale", 1.00))
+    gate_batch_frac = float(ttcfg.get("gate_batch_frac", 0.9))
+    gate_batch_frac = float(np.clip(gate_batch_frac, 0.9, 0.95))
+    gate_band_radius = float(ttcfg.get("gate_radius", 0.15))
+    gate_band_samples = int(ttcfg.get("gate_samples", max(256, tube_samples)))
+    gate_band_xy_np, gate_band_d_np = sample_gate_band(
+        gate_xy=gate_xy,
+        d_targets=gate_d_targets,
+        radius=gate_band_radius,
+        num_samples=gate_band_samples,
+        rng=rng,
+    )
+
+    for _ in range(warmup_steps):
+        n_tube = int(max(256, min(batch_size, int(round(batch_size * gate_batch_frac)))))
+        n_global = int(max(1, batch_size - n_tube))
+        xy_global = sample_adaptive_xy(xs=xs, ys=ys, weight=weight, n=n_global, rng=rng, device=device)
+        xy_tube_np, _, _ = sample_path_tube(
+            path_xy=rsa_path_xy,
+            radius=tube_radius,
+            num_samples=n_tube,
+            rng=rng,
+            env=env,
+            device=device,
+            lookahead=25,
+        )
+        xy_tube = torch.from_numpy(xy_tube_np).to(device=device, dtype=torch.float32)
+        xy = torch.cat([xy_global, xy_tube], dim=0)
+        sdf = env.sdf(xy).detach()
+        free_mask = (sdf >= 0.0).to(dtype=xy.dtype)
+        t_target = torch.from_numpy(rsa_guidance.interpolate_t(xy.detach().cpu().numpy())).to(device=device)
+
+        pred = model(xy)[:, 0]
+        loss_sup = _masked_mean((pred - t_target) ** 2, free_mask)
+        loss_bc = start_bc_loss(model, start_t)
+        loss_obs = obstacle_loss(
+            model=model,
+            xy=xy,
+            env_sdf_fn=env.sdf,
+            speed_fn=env.speed,
+            sdf_band=sdf_band,
+            lambda_int=lambda_int,
+            lambda_grad=lambda_grad,
+            lambda_dir=lambda_dir,
+            lambda_vort=lambda_vort,
+            sdf_scale=sdf_scale,
+        )
+        loss = (
+            float(tcfg.get("lambda_sup", 1.0)) * loss_sup
+            + float(tcfg.get("lambda_bc", 0.0)) * loss_bc
+            + float(lambda_obs) * loss_obs
+        )
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        train_steps += 1
+
+    max_steps = int(tcfg["max_steps"])
+    for step in range(max_steps):
+        n_tube = int(max(256, min(batch_size, int(round(batch_size * gate_batch_frac)))))
+        n_global = int(max(1, batch_size - n_tube))
+        xy_global = sample_adaptive_xy(xs=xs, ys=ys, weight=weight, n=n_global, rng=rng, device=device)
+        xy_tube_np, tube_d_look_np, tube_p_look_np = sample_path_tube(
+            path_xy=rsa_path_xy,
+            radius=tube_radius,
+            num_samples=n_tube,
+            rng=rng,
+            env=env,
+            device=device,
+            lookahead=25,
+        )
+        xy_tube = torch.from_numpy(xy_tube_np).to(device=device, dtype=torch.float32)
+        xy = torch.cat([xy_global, xy_tube], dim=0)
+        sdf = env.sdf(xy).detach()
+        free_mask = (sdf >= 0.0).to(dtype=xy.dtype)
+        t_target = torch.from_numpy(rsa_guidance.interpolate_t(xy.detach().cpu().numpy())).to(device=device)
+        pred = model(xy)[:, 0]
+        loss_sup = torch.zeros((), device=device, dtype=torch.float32)
+        progress = float(step + 1) / float(max(1, max_steps))
+        lambda_phys_now = lambda_phys_start + (lambda_phys_end - lambda_phys_start) * progress
+        lambda_phys_now = 0.8 * lambda_phys_now
+        loss_phys_global = (
+            upwind_physics_loss(model=model, xy=xy_global, speed_fn=env.speed, fd_step=fd_step)
+            if physics_mode == "upwind"
+            else physics_loss(model=model, xy=xy_global, speed_fn=env.speed)
+        )
+        loss_phys_tube = (
+            upwind_physics_loss(model=model, xy=xy_tube, speed_fn=env.speed, fd_step=fd_step)
+            if physics_mode == "upwind"
+            else physics_loss(model=model, xy=xy_tube, speed_fn=env.speed)
+        )
+        loss_phys = loss_phys_global + 0.1 * loss_phys_tube
+        loss_bc = start_bc_loss(model, start_t)
+        loss_obs = obstacle_loss(
+            model=model,
+            xy=xy,
+            env_sdf_fn=env.sdf,
+            speed_fn=env.speed,
+            sdf_band=sdf_band,
+            lambda_int=lambda_int,
+            lambda_grad=lambda_grad,
+            lambda_dir=lambda_dir,
+            lambda_vort=lambda_vort,
+            sdf_scale=sdf_scale,
+        )
+        idx = rng.integers(0, rsa_path_xy.shape[0], size=(path_batch,), endpoint=False)
+        base = rsa_path_xy[idx]
+        base_tang = tang[idx]
+        ang = rng.uniform(0.0, 2 * np.pi, size=(path_batch,)).astype(np.float32)
+        rad = np.sqrt(rng.uniform(0.0, 1.0, size=(path_batch,)).astype(np.float32)) * float(path_radius)
+        offset = np.stack([np.cos(ang) * rad, np.sin(ang) * rad], axis=1).astype(np.float32)
+        anchor_xy = (base + offset).astype(np.float32)
+        anchor_t = torch.from_numpy(rsa_guidance.interpolate_t(anchor_xy)).to(device=device)
+        anchor_xy_t = torch.from_numpy(anchor_xy).to(device=device, dtype=torch.float32).requires_grad_(True)
+        with torch.no_grad():
+            anchor_free = (env.sdf(anchor_xy_t) >= 0.0).to(dtype=anchor_xy_t.dtype)
+        anchor_pred = model(anchor_xy_t)[:, 0]
+        loss_path = _masked_mean((anchor_pred - anchor_t) ** 2, anchor_free)
+        grad_anchor = torch.autograd.grad(
+            outputs=anchor_pred.sum(),
+            inputs=anchor_xy_t,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        gnorm = torch.sqrt(torch.sum(grad_anchor**2, dim=-1) + 1e-12)
+        move_dir = (-grad_anchor) / gnorm.unsqueeze(-1)
+        tang_t = torch.from_numpy(base_tang).to(device=device, dtype=torch.float32)
+        cos = torch.sum(move_dir * tang_t, dim=-1)
+        loss_path_dir = _masked_mean((1.0 - cos) ** 2, anchor_free)
+        goal_xy_t = torch.tensor(goal_xy, dtype=torch.float32, device=device).view(1, 2)
+        goal_pred = model(goal_xy_t)[:, 0]
+        loss_goal = torch.mean((goal_pred - goal_target) ** 2)
+
+        idx_m = rng.integers(0, rsa_path_xy.shape[0] - 1, size=(path_batch,), endpoint=False)
+        p0 = rsa_path_xy[idx_m]
+        p1 = rsa_path_xy[idx_m + 1]
+        xy01 = np.concatenate([p0, p1], axis=0).astype(np.float32)
+        xy01_t = torch.from_numpy(xy01).to(device=device, dtype=torch.float32)
+        t01 = model(xy01_t)[:, 0]
+        t0 = t01[: p0.shape[0]]
+        t1 = t01[p0.shape[0] :]
+        ds = np.linalg.norm(p1 - p0, axis=1).astype(np.float32)
+        f0 = float(cfg.get("rsa", {}).get("speed_free", 1.0))
+        min_dt = torch.from_numpy(ds).to(device=device, dtype=torch.float32) / float(max(1e-6, f0))
+        loss_mono = torch.mean(torch.relu(min_dt - (t1 - t0)) ** 2)
+
+        gate_idx = rng.integers(0, gate_pts.shape[0], size=(gate_batch,), endpoint=False)
+        gate_base = gate_pts[gate_idx]
+        ang2 = rng.uniform(0.0, 2 * np.pi, size=(gate_batch,)).astype(np.float32)
+        rad2 = np.sqrt(rng.uniform(0.0, 1.0, size=(gate_batch,)).astype(np.float32)) * float(gate_radius)
+        offset2 = np.stack([np.cos(ang2) * rad2, np.sin(ang2) * rad2], axis=1).astype(np.float32)
+        gate_xy_sample = (gate_base + offset2).astype(np.float32)
+        gate_xy_t = torch.from_numpy(gate_xy_sample).to(device=device, dtype=torch.float32).requires_grad_(True)
+        with torch.no_grad():
+            gate_free = (env.sdf(gate_xy_t) >= 0.0).to(dtype=gate_xy_t.dtype)
+        gate_pred = model(gate_xy_t)[:, 0]
+        grad_gate = torch.autograd.grad(
+            outputs=gate_pred.sum(),
+            inputs=gate_xy_t,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        ggnorm = torch.sqrt(torch.sum(grad_gate**2, dim=-1) + 1e-12)
+        gate_move = (-grad_gate) / ggnorm.unsqueeze(-1)
+        rsa_grad = _interp_vec_bilinear(xs=xs, ys=ys, vx=dtdx, vy=dtdy, xy=gate_xy_sample)
+        rsa_grad_t = torch.from_numpy(rsa_grad).to(device=device, dtype=torch.float32)
+        rsa_norm = torch.sqrt(torch.sum(rsa_grad_t**2, dim=-1) + 1e-12)
+        rsa_move = (-rsa_grad_t) / rsa_norm.unsqueeze(-1)
+        rsa_cos = torch.sum(gate_move * rsa_move, dim=-1)
+        rsa_ok = (rsa_norm > 1e-4).to(dtype=gate_free.dtype)
+        loss_rsa_dir = _masked_mean((1.0 - rsa_cos) ** 2, gate_free * rsa_ok)
+
+        gf_idx = rng.integers(0, gate_xy.shape[0], size=(gate_force_batch,), endpoint=False)
+        gf_base = gate_xy[gf_idx]
+        ang3 = rng.uniform(0.0, 2 * np.pi, size=(gate_force_batch,)).astype(np.float32)
+        rad3 = np.sqrt(rng.uniform(0.0, 1.0, size=(gate_force_batch,)).astype(np.float32)) * float(gate_force_radius)
+        offset3 = np.stack([np.cos(ang3) * rad3, np.sin(ang3) * rad3], axis=1).astype(np.float32)
+        gf_xy = (gf_base + offset3).astype(np.float32)
+        gf_xy_t = torch.from_numpy(gf_xy).to(device=device, dtype=torch.float32)
+        d_batch = torch.from_numpy(gate_d_targets[gf_idx]).to(device=device, dtype=torch.float32)
+        loss_gate = loss_gate_forcing(
+            model=model,
+            xy=gf_xy_t,
+            d_target=d_batch,
+            env_sdf_fn=env.sdf,
+            lambda_gate=lambda_gate,
+        )
+
+        gate_band_idx = rng.integers(0, gate_band_xy_np.shape[0], size=(min(gate_batch, gate_band_xy_np.shape[0]),), endpoint=False)
+        gate_band_xy_t = torch.from_numpy(gate_band_xy_np[gate_band_idx]).to(device=device, dtype=torch.float32)
+        gate_band_d_t = torch.from_numpy(gate_band_d_np[gate_band_idx]).to(device=device, dtype=torch.float32)
+        with torch.no_grad():
+            gate_band_free = (env.sdf(gate_band_xy_t) >= 0.0).to(dtype=gate_band_xy_t.dtype)
+        gate_band_target_t = torch.from_numpy(rsa_guidance.interpolate_t(gate_band_xy_np[gate_band_idx])).to(device=device, dtype=torch.float32)
+        gate_band_pred_t = model(gate_band_xy_t)[:, 0]
+        loss_mono_tube = loss_monotonicity(
+            model=model,
+            xy=torch.from_numpy(xy_tube_np).to(device=device, dtype=torch.float32),
+            d_target=torch.from_numpy(tube_d_look_np).to(device=device, dtype=torch.float32),
+            env_sdf_fn=env.sdf,
+            alpha=alpha_gate,
+        )
+        loss_mono_gate = loss_monotonicity(
+            model=model,
+            xy=gate_band_xy_t,
+            d_target=gate_band_d_t,
+            env_sdf_fn=env.sdf,
+            alpha=alpha_gate,
+        )
+        loss_curl_gate = loss_curl(model=model, xy=gate_band_xy_t)
+        loss_gate_value = _masked_mean((gate_band_pred_t - gate_band_target_t) ** 2, gate_band_free)
+        gate_step = float(gate_drop_step_scale) * float(gate_band_radius)
+        gate_look_xy_t = gate_band_xy_t + gate_step * gate_band_d_t
+        gate_look_t = model(gate_look_xy_t)[:, 0]
+        with torch.no_grad():
+            gate_look_free = (env.sdf(gate_look_xy_t) >= 0.0).to(dtype=gate_band_xy_t.dtype)
+            gate_pair_free = gate_band_free * gate_look_free
+        gate_min_drop = torch.full_like(gate_band_pred_t, float(gate_drop_scale) * gate_step)
+        loss_gate_drop = _masked_mean(
+            torch.relu(gate_min_drop - (gate_band_pred_t - gate_look_t)) ** 2,
+            gate_pair_free,
+        )
+        tube_xy_t = torch.from_numpy(xy_tube_np).to(device=device, dtype=torch.float32)
+        look_xy_t = torch.from_numpy(tube_p_look_np).to(device=device, dtype=torch.float32)
+        t_tube = model(tube_xy_t)[:, 0]
+        t_look = model(look_xy_t)[:, 0]
+        with torch.no_grad():
+            tube_free = (env.sdf(tube_xy_t) >= 0.0).to(dtype=tube_xy_t.dtype)
+            look_free = (env.sdf(look_xy_t) >= 0.0).to(dtype=tube_xy_t.dtype)
+            look_pair_free = tube_free * look_free
+        look_dist = torch.sqrt(torch.sum((tube_xy_t - look_xy_t) ** 2, dim=-1) + 1e-12)
+        min_drop = float(lookahead_drop_scale) * look_dist
+        loss_lookahead_drop = _masked_mean(torch.relu(min_drop - (t_tube - t_look)) ** 2, look_pair_free)
+
+        loss = (
+            float(tcfg.get("lambda_sup", 1.0)) * loss_sup
+            + float(lambda_phys_now) * loss_phys
+            + float(tcfg.get("lambda_bc", 0.0)) * loss_bc
+            + float(lambda_obs) * loss_obs
+            + float(lambda_path) * loss_path
+            + float(lambda_path_dir) * loss_path_dir
+            + float(lambda_goal) * loss_goal
+            + float(lambda_rsa_dir) * loss_rsa_dir
+            + float(lambda_mono) * loss_mono
+            + loss_gate
+            + float(lambda_mono_gate) * (0.5 * loss_mono_tube + 2.0 * loss_mono_gate)
+            + float(lambda_curl_gate) * loss_curl_gate
+            + float(lambda_gate_value) * loss_gate_value
+            + float(lambda_gate_drop) * loss_gate_drop
+            + float(lambda_lookahead_drop) * loss_lookahead_drop
+        )
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        train_steps += 1
+
+        if check_every > 0 and ((step + 1) % check_every == 0):
+            if float(loss.detach().item()) <= tol:
+                ok_count += 1
+            else:
+                ok_count = 0
+            if ok_count >= patience:
+                converged_step = train_steps
+                break
+
+    if converged_step < 0:
+        converged_step = train_steps
+
+    probe_np, probe_d_look_np, probe_p_look_np = sample_path_tube(
+        path_xy=rsa_path_xy,
+        radius=tube_radius,
+        num_samples=max(512, tube_samples),
+        rng=rng,
+        env=env,
+        device=device,
+        lookahead=25,
+    )
+    tube_xy_probe = torch.from_numpy(probe_np).to(device=device, dtype=torch.float32).requires_grad_(True)
+    d_look_p = torch.from_numpy(probe_d_look_np).to(device=device, dtype=torch.float32)
+
+    t_probe = model(tube_xy_probe)
+    if t_probe.ndim == 2:
+        t_probe = t_probe[:, 0]
+    grad_probe = torch.autograd.grad(t_probe.sum(), tube_xy_probe, create_graph=False, retain_graph=False)[0]
+    proj = torch.sum((-grad_probe) * d_look_p, dim=-1)
+    with torch.no_grad():
+        sdf_probe = env.sdf(tube_xy_probe).detach()
+        if sdf_probe.ndim == 2:
+            sdf_probe = sdf_probe[:, 0]
+        free_probe = sdf_probe >= 0.0
+        if torch.any(free_probe):
+            proj_mean = float(torch.mean(proj[free_probe]).item())
+            proj_min = float(torch.min(proj[free_probe]).item())
+        else:
+            proj_mean = float("nan")
+            proj_min = float("nan")
+        if torch.any(free_probe) and (proj_mean < 0.1):
+            look_xy_probe = torch.from_numpy(probe_p_look_np).to(device=device, dtype=torch.float32)
+            t_look_probe = model(look_xy_probe)[:, 0]
+            delta = t_probe.detach() - t_look_probe.detach()
+            delta_mean = float(torch.mean(delta[free_probe]).item())
+            print(f"[path_tube_lookahead] mean(T(x)-T(look)) = {delta_mean:.3f}")
+
+    print(f"[path_tube_lookahead] mean dot(-gradT, d_look) = {proj_mean:.3f} | min dot = {proj_min:.3f}")
+    return model, converged_step, train_steps
+
+
+def _train_vanilla_pinn(
+    env: Maze2DEnv,
+    start_xy: Tuple[float, float],
+    cfg: Dict[str, Any],
+    rng: np.random.Generator,
+    device: torch.device,
+) -> Tuple[VanillaTimeNN, int, int]:
+    mcfg = cfg["model"]
+    tcfg = cfg["train"]
+    model = VanillaTimeNN(
+        hidden_dim=int(mcfg["hidden_dim"]),
+        num_layers=int(mcfg["num_layers"]),
+        activation=str(mcfg.get("activation", "tanh")),
+    ).to(device=device)
+    opt = torch.optim.Adam(model.parameters(), lr=float(tcfg["lr"]))
+    start_t = torch.tensor(start_xy, dtype=torch.float32, device=device)
+    batch_size = int(tcfg["batch_size"])
+
+    tol, patience, check_every = _get_convergence_cfg(cfg)
+    ok_count = 0
+    converged_step = -1
+    train_steps = 0
+    ocfg = tcfg.get("obstacle", {}) if isinstance(tcfg, dict) else {}
+    sdf_band = float(ocfg.get("sdf_band", 0.05))
+    lambda_int = float(ocfg.get("lambda_int", 100.0))
+    lambda_grad = float(ocfg.get("lambda_grad", 10.0))
+    lambda_dir = float(ocfg.get("lambda_dir", 50.0))
+    lambda_vort = float(ocfg.get("lambda_vort", 20.0))
+    sdf_scale = float(ocfg.get("sdf_scale", 10.0))
+    lambda_obs = float(tcfg.get("lambda_obs", 1.0))
+    phcfg = tcfg.get("physics", {}) if isinstance(tcfg, dict) else {}
+    physics_mode = str(phcfg.get("mode", "autograd")).lower()
+    fd_step = float(phcfg.get("fd_step", 0.01))
+
+    for step in range(int(tcfg["max_steps"])):
+        xy = env.sample_uniform(batch_size, rng=rng, device=device)
+        loss_phys = (
+            upwind_physics_loss(model=model, xy=xy, speed_fn=env.speed, fd_step=fd_step)
+            if physics_mode == "upwind"
+            else physics_loss(model=model, xy=xy, speed_fn=env.speed)
+        )
+        loss_bc = start_bc_loss(model, start_t)
+        loss_obs = obstacle_loss(
+            model=model,
+            xy=xy,
+            env_sdf_fn=env.sdf,
+            speed_fn=env.speed,
+            sdf_band=sdf_band,
+            lambda_int=lambda_int,
+            lambda_grad=lambda_grad,
+            lambda_dir=lambda_dir,
+            lambda_vort=lambda_vort,
+            sdf_scale=sdf_scale,
+        )
+        loss = (
+            float(tcfg.get("lambda_phys", 1.0)) * loss_phys
+            + float(tcfg.get("lambda_bc", 5.0)) * loss_bc
+            + float(lambda_obs) * loss_obs
+        )
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        train_steps += 1
+
+        if check_every > 0 and ((step + 1) % check_every == 0):
+            if float(loss.detach().item()) <= tol:
+                ok_count += 1
+            else:
+                ok_count = 0
+            if ok_count >= patience:
+                converged_step = train_steps
+                break
+
+    if converged_step < 0:
+        converged_step = train_steps
+    return model, converged_step, train_steps
+
+
+def _summarize(metrics_all: List[Dict[str, EvalMetrics]]) -> Dict[str, Dict[str, float]]:
+    names = sorted({k for m in metrics_all for k in m.keys()})
+    out: Dict[str, Dict[str, float]] = {}
+    for name in names:
+        success = np.asarray([float(m[name].success) for m in metrics_all], dtype=np.float32)
+        gap = np.asarray([m[name].optimality_gap for m in metrics_all], dtype=np.float32)
+        gns = np.asarray(
+            [m[name].grad_norm_start if m[name].grad_norm_start is not None else np.nan for m in metrics_all],
+            dtype=np.float32,
+        )
+        csteps = np.asarray(
+            [m[name].converge_steps if m[name].converge_steps is not None else np.nan for m in metrics_all],
+            dtype=np.float32,
+        )
+        gap = np.where(np.isfinite(gap), gap, np.nan)
+        gns = np.where(np.isfinite(gns), gns, np.nan)
+        csteps = np.where(np.isfinite(csteps), csteps, np.nan)
+        gap_mean = float(np.nanmean(gap)) if np.any(np.isfinite(gap)) else float("nan")
+        gns_mean = float(np.nanmean(gns)) if np.any(np.isfinite(gns)) else float("nan")
+        csteps_mean = float(np.nanmean(csteps)) if np.any(np.isfinite(csteps)) else float("nan")
+        out[name] = {
+            "SR_mean": float(np.mean(success)),
+            "OptimalityGap_mean": gap_mean,
+            "GradNormStart_mean": gns_mean,
+            "ConvergeSteps_mean": csteps_mean,
+        }
+    return out
+
+
+def run(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    device = torch.device(cfg.get("device", "cpu"))
+    env = _make_env(cfg, device=device)
+
+    start_xy = tuple(cfg["env"]["start"])
+    goal_xy = tuple(cfg["env"]["goal"])
+
+    out_dir = str(cfg["eval"].get("out_dir", "outputs"))
+    os.makedirs(out_dir, exist_ok=True)
+
+    num_seeds = int(cfg.get("num_seeds", 30))
+    metrics_all: List[Dict[str, EvalMetrics]] = []
+
+    for s in range(num_seeds):
+        rng = _set_seed(int(cfg.get("seed", 0)) + s)
+
+        xs, ys = _grid_coords(env.bounds, tuple(cfg["rsa"]["grid_size"]))
+        speed = env.speed_grid(tuple(cfg["rsa"]["grid_size"]))
+        free_mask = speed > 0.0
+
+        rsa_engine = RSAEngine(xs=xs, ys=ys, connectivity=int(cfg["rsa"].get("connectivity", 8)))
+        rsa_low = rsa_engine.solve(speed=speed, start_xy=start_xy, goal_xy=goal_xy)
+        weight = RSAEngine.wavefront_weight(
+            t=rsa_low.t,
+            free_mask=free_mask,
+            base_weight=float(cfg["train"]["adaptive_sampling"].get("base_weight", 0.2)),
+            wavefront_power=float(cfg["train"]["adaptive_sampling"].get("wavefront_power", 1.0)),
+            obstacle_band=float(cfg["train"]["adaptive_sampling"].get("obstacle_band", 0.0)),
+            xs=xs,
+            ys=ys,
+        )
+        xx, yy = np.meshgrid(xs, ys)
+        xy_grid = np.stack([xx.reshape(-1), yy.reshape(-1)], axis=-1).astype(np.float32)
+        with torch.no_grad():
+            sdf_grid = env.sdf(torch.from_numpy(xy_grid).to(device=device)).cpu().numpy().reshape(speed.shape)
+        weight = apply_sdf_surface_boost(
+            weight=weight,
+            sdf_grid=sdf_grid,
+            band=float(cfg["train"].get("sdf_surface_band", 0.05)),
+            boost=float(cfg["train"].get("sdf_surface_boost", 0.5)),
+        )
+
+        xs_ref, ys_ref = _grid_coords(env.bounds, tuple(cfg["eval"]["reference_grid_size"]))
+        speed_ref = env.speed_grid(tuple(cfg["eval"]["reference_grid_size"]))
+        rsa_ref = RSAEngine(xs=xs_ref, ys=ys_ref, connectivity=int(cfg["rsa"].get("connectivity", 8))).solve(
+            speed=speed_ref,
+            start_xy=start_xy,
+            goal_xy=goal_xy,
+        )
+        ref_path_xy = rsa_ref.backtrack_path_xy()
+        with torch.no_grad():
+            sdf_path_ref = env.sdf(torch.from_numpy(ref_path_xy).to(device=device, dtype=torch.float32)).cpu().numpy()
+        gate_info = extract_gateway_segment(
+            path_xy=ref_path_xy,
+            sdf_values=sdf_path_ref,
+            segment_len=int(cfg["train"].get("gate", {}).get("segment_len", 16)),
+            sdf_weight=float(cfg["train"].get("gate", {}).get("sdf_weight", 1.0)),
+            diff_weight=float(cfg["train"].get("gate", {}).get("diff_weight", 1.0)),
+        )
+        weight = _gate_boost_weight(
+            weight=weight,
+            xs=xs,
+            ys=ys,
+            gate_pts=gate_info.gate_xy,
+            radius=float(cfg["train"].get("gate_forcing", {}).get("radius", 0.15)),
+            boost=float(cfg["train"].get("gate", {}).get("weight_boost", 2.0)),
+        )
+
+        vanilla, vanilla_conv, vanilla_steps = _train_vanilla_pinn(env, start_xy, cfg, rng, device=device)
+        rhp, rhp_conv, rhp_steps = _train_rhp(
+            env,
+            start_xy,
+            goal_xy,
+            rsa_ref,
+            ref_path_xy,
+            gate_info.gate_xy,
+            gate_info.d_target,
+            gate_info.d_targets,
+            xs,
+            ys,
+            weight,
+            cfg,
+            rng,
+            device=device,
+        )
+
+        models = {"vanilla_pinn": vanilla, "rhp_pinn": rhp}
+        metrics, paths = evaluate_methods(
+            env=env,
+            start_xy=start_xy,
+            goal_xy=goal_xy,
+            rsa_low=rsa_low,
+            rsa_ref=rsa_ref,
+            models=models,
+            path_step=float(cfg["eval"]["path_step"]),
+            max_path_steps=int(cfg["eval"]["max_path_steps"]),
+            goal_tol=float(cfg["eval"]["goal_tol"]),
+            grad_probe_radius=float(cfg["eval"]["grad_probe_radius"]),
+            grad_probe_points=int(cfg["eval"]["grad_probe_points"]),
+            strict_goal_tol=bool(cfg["eval"].get("strict_goal_tol", False)),
+        )
+        metrics["vanilla_pinn"] = EvalMetrics(
+            success=metrics["vanilla_pinn"].success,
+            length=metrics["vanilla_pinn"].length,
+            smoothness=metrics["vanilla_pinn"].smoothness,
+            optimality_gap=metrics["vanilla_pinn"].optimality_gap,
+            regret=metrics["vanilla_pinn"].regret,
+            gating_ratio=metrics["vanilla_pinn"].gating_ratio,
+            gating_efficiency=metrics["vanilla_pinn"].gating_efficiency,
+            grad_norm_start=metrics["vanilla_pinn"].grad_norm_start,
+            converge_steps=int(vanilla_conv),
+            train_steps=int(vanilla_steps),
+        )
+        metrics["rhp_pinn"] = EvalMetrics(
+            success=metrics["rhp_pinn"].success,
+            length=metrics["rhp_pinn"].length,
+            smoothness=metrics["rhp_pinn"].smoothness,
+            optimality_gap=metrics["rhp_pinn"].optimality_gap,
+            regret=metrics["rhp_pinn"].regret,
+            gating_ratio=metrics["rhp_pinn"].gating_ratio,
+            gating_efficiency=metrics["rhp_pinn"].gating_efficiency,
+            grad_norm_start=metrics["rhp_pinn"].grad_norm_start,
+            converge_steps=int(rhp_conv),
+            train_steps=int(rhp_steps),
+        )
+        metrics_all.append(metrics)
+
+        if bool(cfg["eval"].get("save_plots", True)) and (s == 0):
+            out_path = os.path.join(out_dir, f"fields_paths_seed{int(cfg.get('seed', 0))}.png")
+            save_field_and_paths_plot(
+                env=env,
+                rsa=rsa_low,
+                start_xy=start_xy,
+                goal_xy=goal_xy,
+                models=models,
+                paths=paths,
+                out_path=out_path,
+            )
+            max_len = float(cfg["eval"]["path_step"]) * float(cfg["eval"]["max_path_steps"])
+            if (not metrics["rhp_pinn"].success) and (float(metrics["rhp_pinn"].length) >= 0.98 * max_len):
+                qpath = os.path.join(out_dir, f"fields_quiver_seed{int(cfg.get('seed', 0))}.png")
+                save_field_quiver_plot(
+                    env=env,
+                    rsa=rsa_low,
+                    start_xy=start_xy,
+                    goal_xy=goal_xy,
+                    model=models["rhp_pinn"],
+                    out_path=qpath,
+                    stride=4,
+                )
+
+    summary = _summarize(metrics_all)
+    results = {
+        "config": cfg,
+        "summary": summary,
+        "per_seed": [
+            {k: asdict(v) for k, v in metrics.items()}
+            for metrics in metrics_all
+        ],
+    }
+    with open(os.path.join(out_dir, "results.json"), "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    archive_dir = _archive_outputs(cfg=cfg, out_dir=out_dir)
+    results["archive_dir"] = str(archive_dir)
+    return results
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", type=str, default=os.path.join(os.path.dirname(__file__), "configs", "default.yaml"))
+    args = ap.parse_args()
+    cfg = _load_cfg(args.config)
+    results = run(cfg)
+    print(json.dumps(results["summary"], ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

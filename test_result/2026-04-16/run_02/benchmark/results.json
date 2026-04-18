@@ -1,0 +1,1282 @@
+{
+  "config": {
+    "seed": 0,
+    "device": "cpu",
+    "env": {
+      "name": "u_maze",
+      "bounds": {
+        "x_min": -1.0,
+        "x_max": 1.0,
+        "y_min": -1.0,
+        "y_max": 1.0
+      },
+      "start": [
+        -0.8,
+        -0.8
+      ],
+      "goal": [
+        0.8,
+        0.8
+      ],
+      "obstacle_inflation": 0.01,
+      "u_maze": {
+        "wall_thickness": 0.14,
+        "inner_gap": 0.55,
+        "depth": 0.85,
+        "center": [
+          0.0,
+          0.0
+        ],
+        "rotation_deg": 0.0
+      },
+      "narrow_passage": {
+        "passage_width": 0.12,
+        "block_width": 0.9,
+        "block_height": 0.35
+      }
+    },
+    "rsa": {
+      "grid_size": [
+        80,
+        80
+      ],
+      "connectivity": 8,
+      "speed_free": 1.0,
+      "speed_obstacle": 0.0
+    },
+    "train": {
+      "max_steps": 2500,
+      "warmup_steps": 500,
+      "batch_size": 2048,
+      "lr": 0.001,
+      "lambda_sup": 1.0,
+      "lambda_phys": 1.0,
+      "lambda_phys_start": 0.1,
+      "lambda_bc": 5.0,
+      "lambda_obs": 1.0,
+      "lambda_goal": 5.0,
+      "sdf_surface_band": 0.05,
+      "sdf_surface_boost": 0.5,
+      "physics": {
+        "mode": "upwind",
+        "fd_step": 0.01
+      },
+      "obstacle": {
+        "sdf_band": 0.05,
+        "lambda_int": 100.0,
+        "lambda_grad": 10.0,
+        "lambda_dir": 50.0,
+        "lambda_vort": 20.0,
+        "sdf_scale": 10.0
+      },
+      "path_anchor": {
+        "lambda_path": 20.0,
+        "lambda_dir": 10.0,
+        "lambda_mono": 20.0,
+        "radius": 0.05,
+        "batch_size": 512
+      },
+      "gate": {
+        "sdf_band": 0.03,
+        "segment_len": 16,
+        "sdf_weight": 1.0,
+        "diff_weight": 1.0,
+        "radius": 0.07,
+        "batch_size": 512,
+        "lambda_rsa_dir": 0.0,
+        "weight_boost": 2.0
+      },
+      "gate_forcing": {
+        "radius": 0.15,
+        "batch_size": 512,
+        "lambda_gate": 150.0
+      },
+      "adaptive_sampling": {
+        "base_weight": 0.2,
+        "wavefront_power": 1.0,
+        "obstacle_band": 0.06
+      }
+    },
+    "model": {
+      "hidden_dim": 128,
+      "num_layers": 4,
+      "activation": "tanh",
+      "dist_eps": 1e-06
+    },
+    "eval": {
+      "path_step": 0.02,
+      "max_path_steps": 400,
+      "goal_tol": 0.05,
+      "grad_probe_radius": 0.03,
+      "grad_probe_points": 256,
+      "reference_grid_size": [
+        220,
+        220
+      ],
+      "save_plots": true,
+      "out_dir": "outputs"
+    }
+  },
+  "summary": {
+    "rhp_pinn": {
+      "SR_mean": 0.06666667014360428,
+      "OptimalityGap_mean": 1.6882917881011963,
+      "GradNormStart_mean": 4.27954626083374,
+      "ConvergeSteps_mean": 3000.0
+    },
+    "rsa": {
+      "SR_mean": 1.0,
+      "OptimalityGap_mean": 0.0019386123167350888,
+      "GradNormStart_mean": NaN,
+      "ConvergeSteps_mean": NaN
+    },
+    "vanilla_pinn": {
+      "SR_mean": 0.0,
+      "OptimalityGap_mean": 1.7140100002288818,
+      "GradNormStart_mean": 0.28617748618125916,
+      "ConvergeSteps_mean": 2500.0
+    }
+  },
+  "per_seed": [
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.999993801116943,
+        "smoothness": 2.879979372024536,
+        "optimality_gap": 1.8136592556808657,
+        "regret": 5.156723499298096,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.5038419365882874,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999999046325684,
+        "smoothness": 1.8679523468017578,
+        "optimality_gap": 1.8136611004610603,
+        "regret": 5.156728744506836,
+        "gating_ratio": 0.3225,
+        "gating_efficiency": 15.989856572114219,
+        "grad_norm_start": 9.12887191772461,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.980628967285156,
+        "smoothness": 2.971639394760132,
+        "optimality_gap": 1.8068484949102868,
+        "regret": 5.137358665466309,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.32174426317214966,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.81874942779541,
+        "smoothness": 1.7038549184799194,
+        "optimality_gap": 1.749914217720343,
+        "regret": 4.9754791259765625,
+        "gating_ratio": 0.5275,
+        "gating_efficiency": 9.432187916543247,
+        "grad_norm_start": 3.405007839202881,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.999988555908203,
+        "smoothness": 3.0054080486297607,
+        "optimality_gap": 1.8136574109006713,
+        "regret": 5.1567182540893555,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.4357854127883911,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.868124961853027,
+        "smoothness": 1.912962794303894,
+        "optimality_gap": 1.7672799722270511,
+        "regret": 5.02485466003418,
+        "gating_ratio": 0.5025,
+        "gating_efficiency": 9.999710766237175,
+        "grad_norm_start": 5.833379745483398,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.965628623962402,
+        "smoothness": 2.9317636489868164,
+        "optimality_gap": 1.8015727589687716,
+        "regret": 5.122358322143555,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.4722263813018799,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999999046325684,
+        "smoothness": 2.322021484375,
+        "optimality_gap": 1.8136611004610603,
+        "regret": 5.156728744506836,
+        "gating_ratio": 0.56,
+        "gating_efficiency": 9.20844418661935,
+        "grad_norm_start": 2.1222026348114014,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 8.000003814697266,
+        "smoothness": 2.999129295349121,
+        "optimality_gap": 1.8136627775339642,
+        "regret": 5.156733512878418,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.3683513402938843,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999999046325684,
+        "smoothness": 2.5507683753967285,
+        "optimality_gap": 1.8136611004610603,
+        "regret": 5.156728744506836,
+        "gating_ratio": 0.555,
+        "gating_efficiency": 9.29140314325556,
+        "grad_norm_start": 0.20676638185977936,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.9999918937683105,
+        "smoothness": 2.9027140140533447,
+        "optimality_gap": 1.8136585848517042,
+        "regret": 5.156721591949463,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.3304711580276489,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999999046325684,
+        "smoothness": 1.2625365257263184,
+        "optimality_gap": 1.8136611004610603,
+        "regret": 5.156728744506836,
+        "gating_ratio": 0.34,
+        "gating_efficiency": 15.166849248549516,
+        "grad_norm_start": 3.9606680870056152,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.971242904663086,
+        "smoothness": 3.011387348175049,
+        "optimality_gap": 1.803547344605983,
+        "regret": 5.127972602844238,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.19643235206604004,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 8.0,
+        "smoothness": 2.3108108043670654,
+        "optimality_gap": 1.813661435875641,
+        "regret": 5.156729698181152,
+        "gating_ratio": 0.5575,
+        "gating_efficiency": 9.249739368934803,
+        "grad_norm_start": 4.554206848144531,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.953123092651367,
+        "smoothness": 2.860011577606201,
+        "optimality_gap": 1.7971744675706476,
+        "regret": 5.1098527908325195,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.48363104462623596,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999993324279785,
+        "smoothness": 3.040910005569458,
+        "optimality_gap": 1.8136590879735754,
+        "regret": 5.1567230224609375,
+        "gating_ratio": 0.015,
+        "gating_efficiency": 343.7815348307292,
+        "grad_norm_start": 5.194823265075684,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.944369316101074,
+        "smoothness": 2.398803472518921,
+        "optimality_gap": 1.794095697133419,
+        "regret": 5.101099014282227,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.41139400005340576,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.963749885559082,
+        "smoothness": 2.14715313911438,
+        "optimality_gap": 1.8009119922445815,
+        "regret": 5.120479583740234,
+        "gating_ratio": 0.5425,
+        "gating_efficiency": 9.438672043760802,
+        "grad_norm_start": 1.4022362232208252,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.982493877410889,
+        "smoothness": 2.483748435974121,
+        "optimality_gap": 1.807504398123055,
+        "regret": 5.139223575592041,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.00403366656973958,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999999523162842,
+        "smoothness": 3.0263824462890625,
+        "optimality_gap": 1.8136612681683506,
+        "regret": 5.156729221343994,
+        "gating_ratio": 0.015,
+        "gating_efficiency": 343.7819480895996,
+        "grad_norm_start": 5.45832633972168,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.948117733001709,
+        "smoothness": 2.9940922260284424,
+        "optimality_gap": 1.7954140441432815,
+        "regret": 5.104847431182861,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.3613322973251343,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.963749885559082,
+        "smoothness": 1.8043047189712524,
+        "optimality_gap": 1.8009119922445815,
+        "regret": 5.120479583740234,
+        "gating_ratio": 0.375,
+        "gating_efficiency": 13.654612223307291,
+        "grad_norm_start": 1.6428024768829346,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.984993934631348,
+        "smoothness": 2.426488161087036,
+        "optimality_gap": 1.808383687446641,
+        "regret": 5.1417236328125,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.04896393418312073,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999999046325684,
+        "smoothness": 2.988528251647949,
+        "optimality_gap": 1.8136611004610603,
+        "regret": 5.156728744506836,
+        "gating_ratio": 0.02,
+        "gating_efficiency": 257.8364372253418,
+        "grad_norm_start": 6.684704780578613,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.948117256164551,
+        "smoothness": 3.0188746452331543,
+        "optimality_gap": 1.795413876435991,
+        "regret": 5.104846954345703,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.012119468301534653,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 8.0,
+        "smoothness": 1.0224086046218872,
+        "optimality_gap": 1.813661435875641,
+        "regret": 5.156729698181152,
+        "gating_ratio": 0.34,
+        "gating_efficiency": 15.166852053473976,
+        "grad_norm_start": 0.9247231483459473,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.938128471374512,
+        "smoothness": 2.972083568572998,
+        "optimality_gap": 1.7919007441166173,
+        "regret": 5.094858169555664,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.5014529824256897,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": true,
+        "length": 3.002499580383301,
+        "smoothness": 0.23732419312000275,
+        "optimality_gap": 0.0560021600698807,
+        "regret": 0.15922927856445312,
+        "gating_ratio": 0.6052631578947368,
+        "gating_efficiency": 0.26307446023692255,
+        "grad_norm_start": 5.996048927307129,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 8.000003814697266,
+        "smoothness": 3.004711389541626,
+        "optimality_gap": 1.8136627775339642,
+        "regret": 5.156733512878418,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.41555291414260864,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999992847442627,
+        "smoothness": 3.003983736038208,
+        "optimality_gap": 1.813658920266285,
+        "regret": 5.156722545623779,
+        "gating_ratio": 0.0175,
+        "gating_efficiency": 294.6698597499302,
+        "grad_norm_start": 5.50186824798584,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.946874141693115,
+        "smoothness": 2.804671287536621,
+        "optimality_gap": 1.794976663529909,
+        "regret": 5.103603839874268,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.024286508560180664,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999997615814209,
+        "smoothness": 2.828202724456787,
+        "optimality_gap": 1.813660597339189,
+        "regret": 5.156727313995361,
+        "gating_ratio": 0.045,
+        "gating_efficiency": 114.59394031100804,
+        "grad_norm_start": 3.202085494995117,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.94437313079834,
+        "smoothness": 2.8677761554718018,
+        "optimality_gap": 1.7940970387917423,
+        "regret": 5.101102828979492,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.4651319980621338,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 8.000003814697266,
+        "smoothness": 2.9719738960266113,
+        "optimality_gap": 1.8136627775339642,
+        "regret": 5.156733512878418,
+        "gating_ratio": 0.03,
+        "gating_efficiency": 171.89111709594727,
+        "grad_norm_start": 8.312138557434082,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.953128814697266,
+        "smoothness": 2.979431390762329,
+        "optimality_gap": 1.7971764800581325,
+        "regret": 5.109858512878418,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.440682053565979,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.946249961853027,
+        "smoothness": 1.9761524200439453,
+        "optimality_gap": 1.7947571346867708,
+        "regret": 5.10297966003418,
+        "gating_ratio": 0.5425,
+        "gating_efficiency": 9.406414119878672,
+        "grad_norm_start": 1.6161656379699707,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 8.00000286102295,
+        "smoothness": 2.784019947052002,
+        "optimality_gap": 1.8136624421193834,
+        "regret": 5.156732559204102,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.3811047673225403,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 8.000001907348633,
+        "smoothness": 3.0046534538269043,
+        "optimality_gap": 1.8136621067048027,
+        "regret": 5.156731605529785,
+        "gating_ratio": 0.02,
+        "gating_efficiency": 257.83658027648926,
+        "grad_norm_start": 4.535821914672852,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 8.00000286102295,
+        "smoothness": 2.889113426208496,
+        "optimality_gap": 1.8136624421193834,
+        "regret": 5.156732559204102,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.44671177864074707,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.951250076293945,
+        "smoothness": 2.058905601501465,
+        "optimality_gap": 1.7965157133339424,
+        "regret": 5.107979774475098,
+        "gating_ratio": 0.215,
+        "gating_efficiency": 23.758045462674872,
+        "grad_norm_start": 1.3698254823684692,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.944378852844238,
+        "smoothness": 2.8921685218811035,
+        "optimality_gap": 1.7940990512792272,
+        "regret": 5.101108551025391,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.018443375825881958,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999998092651367,
+        "smoothness": 3.0266072750091553,
+        "optimality_gap": 1.8136607650464793,
+        "regret": 5.1567277908325195,
+        "gating_ratio": 0.015,
+        "gating_efficiency": 343.78185272216797,
+        "grad_norm_start": 5.2485880851745605,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.999988555908203,
+        "smoothness": 3.0993027687072754,
+        "optimality_gap": 1.8136574109006713,
+        "regret": 5.1567182540893555,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.2528071403503418,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": true,
+        "length": 3.0556247234344482,
+        "smoothness": 0.3314889967441559,
+        "optimality_gap": 0.07468668085467717,
+        "regret": 0.21235442161560059,
+        "gating_ratio": 0.5723270440251572,
+        "gating_efficiency": 0.37103684655912633,
+        "grad_norm_start": 4.753480434417725,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.963120460510254,
+        "smoothness": 2.4273931980133057,
+        "optimality_gap": 1.8006906186212488,
+        "regret": 5.119850158691406,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.44154369831085205,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.927499771118164,
+        "smoothness": 2.281092405319214,
+        "optimality_gap": 1.7881625486135218,
+        "regret": 5.084229469299316,
+        "gating_ratio": 0.4925,
+        "gating_efficiency": 10.323308567105212,
+        "grad_norm_start": 1.438283920288086,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.963117599487305,
+        "smoothness": 3.0511019229888916,
+        "optimality_gap": 1.8006896123775062,
+        "regret": 5.119847297668457,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.006233833730220795,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.919374465942383,
+        "smoothness": 1.8796683549880981,
+        "optimality_gap": 1.7853048163850451,
+        "regret": 5.076104164123535,
+        "gating_ratio": 0.3775,
+        "gating_efficiency": 13.446633547347114,
+        "grad_norm_start": 6.323947906494141,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.967492580413818,
+        "smoothness": 3.050417423248291,
+        "optimality_gap": 1.802228326766959,
+        "regret": 5.124222278594971,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.0021065068431198597,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999999046325684,
+        "smoothness": 2.731889486312866,
+        "optimality_gap": 1.8136611004610603,
+        "regret": 5.156728744506836,
+        "gating_ratio": 0.0525,
+        "gating_efficiency": 98.22340465727306,
+        "grad_norm_start": 6.7314677238464355,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 0.32812488079071045,
+        "smoothness": 0.11816157400608063,
+        "optimality_gap": -0.8845959595956484,
+        "regret": -2.515145421028137,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.006007019896060228,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.963749408721924,
+        "smoothness": 2.375737190246582,
+        "optimality_gap": 1.800911824537291,
+        "regret": 5.120479106903076,
+        "gating_ratio": 0.1925,
+        "gating_efficiency": 26.599891464431565,
+        "grad_norm_start": 1.3175654411315918,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.938748359680176,
+        "smoothness": 2.8917465209960938,
+        "optimality_gap": 1.7921187635941418,
+        "regret": 5.095478057861328,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.5616132020950317,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999999046325684,
+        "smoothness": 3.057401180267334,
+        "optimality_gap": 1.8136611004610603,
+        "regret": 5.156728744506836,
+        "gating_ratio": 0.0125,
+        "gating_efficiency": 412.5382995605469,
+        "grad_norm_start": 4.376215934753418,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.9824981689453125,
+        "smoothness": 2.717764377593994,
+        "optimality_gap": 1.8075059074886688,
+        "regret": 5.139227867126465,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.32403564453125,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999997138977051,
+        "smoothness": 3.012659788131714,
+        "optimality_gap": 1.8136604296318986,
+        "regret": 5.156726837158203,
+        "gating_ratio": 0.0175,
+        "gating_efficiency": 294.67010498046875,
+        "grad_norm_start": 4.4778947830200195,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.985003471374512,
+        "smoothness": 2.6311707496643066,
+        "optimality_gap": 1.808387041592449,
+        "regret": 5.141733169555664,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.12510338425636292,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.999998092651367,
+        "smoothness": 2.9752697944641113,
+        "optimality_gap": 1.8136607650464793,
+        "regret": 5.1567277908325195,
+        "gating_ratio": 0.025,
+        "gating_efficiency": 206.26911163330078,
+        "grad_norm_start": 5.594034671783447,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    },
+    {
+      "rsa": {
+        "success": true,
+        "length": 2.8487823009490967,
+        "smoothness": 0.05392485484480858,
+        "optimality_gap": 0.0019386124234199765,
+        "regret": 0.0055119991302490234,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": null,
+        "converge_steps": null,
+        "train_steps": null
+      },
+      "vanilla_pinn": {
+        "success": false,
+        "length": 7.966248512268066,
+        "smoothness": 2.302830696105957,
+        "optimality_gap": 1.801790778446296,
+        "regret": 5.122978210449219,
+        "gating_ratio": null,
+        "gating_efficiency": null,
+        "grad_norm_start": 0.22218050062656403,
+        "converge_steps": 2500,
+        "train_steps": 2500
+      },
+      "rhp_pinn": {
+        "success": false,
+        "length": 7.925624847412109,
+        "smoothness": 1.4315119981765747,
+        "optimality_gap": 1.787503123547655,
+        "regret": 5.082354545593262,
+        "gating_ratio": 0.42,
+        "gating_efficiency": 12.100844156174434,
+        "grad_norm_start": 7.072237491607666,
+        "converge_steps": 3000,
+        "train_steps": 3000
+      }
+    }
+  ]
+}

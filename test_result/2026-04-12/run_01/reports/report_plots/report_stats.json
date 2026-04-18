@@ -1,0 +1,90 @@
+{
+  "results_json_summary": {
+    "rhp_pinn": {
+      "SR_mean": 1.0,
+      "OptimalityGap_mean": 0.24020925164222717,
+      "GradNormStart_mean": 4.339211463928223,
+      "ConvergeSteps_mean": 3000.0
+    },
+    "rsa": {
+      "SR_mean": 1.0,
+      "OptimalityGap_mean": 0.0019386124331504107,
+      "GradNormStart_mean": NaN,
+      "ConvergeSteps_mean": NaN
+    },
+    "vanilla_pinn": {
+      "SR_mean": 0.0,
+      "OptimalityGap_mean": 1.7072697877883911,
+      "GradNormStart_mean": 0.5038419365882874,
+      "ConvergeSteps_mean": 2500.0
+    }
+  },
+  "seed0_results_json": {
+    "rsa": {
+      "success": true,
+      "length": 2.8487823009490967,
+      "smoothness": 0.05392485484480858,
+      "optimality_gap": 0.0019386124234199765,
+      "regret": 0.0055119991302490234,
+      "gating_ratio": null,
+      "gating_efficiency": null,
+      "grad_norm_start": null,
+      "converge_steps": null,
+      "train_steps": null
+    },
+    "vanilla_pinn": {
+      "success": false,
+      "length": 7.697499752044678,
+      "smoothness": 1.4728224277496338,
+      "optimality_gap": 1.7072697756238158,
+      "regret": 0.0,
+      "gating_ratio": null,
+      "gating_efficiency": null,
+      "grad_norm_start": 0.5038419365882874,
+      "converge_steps": 2500,
+      "train_steps": 2500
+    },
+    "rhp_pinn": {
+      "success": true,
+      "length": 3.526250123977661,
+      "smoothness": 0.4996980130672455,
+      "optimality_gap": 0.2402092483861521,
+      "regret": 0.0,
+      "gating_ratio": null,
+      "gating_efficiency": null,
+      "grad_norm_start": 4.339211463928223,
+      "converge_steps": 3000,
+      "train_steps": 3000
+    }
+  },
+  "seed0_live": {
+    "rsa_success": true,
+    "rsa_length": 2.8487823009490967,
+    "vanilla_success": false,
+    "vanilla_length": 7.999993801116943,
+    "vanilla_converge_steps": 2500,
+    "vanilla_train_steps": 2500,
+    "rhp_success": false,
+    "rhp_length": 7.660001754760742,
+    "rhp_converge_steps": 3000,
+    "rhp_train_steps": 3000,
+    "transformer_gate_ratio": 0.6379075698337112,
+    "transformer_gate_prob_mean": 0.2751192841725023,
+    "takeover_count_alpha_gt_035": 358,
+    "plots": {
+      "trajectory_comparison": "/Users/mawei/MT202601/RSA-Guided Hybrid PINN/outputs/report_plots/trajectory_comparison_seed0.png",
+      "gate_probability_heatmap": "/Users/mawei/MT202601/RSA-Guided Hybrid PINN/outputs/report_plots/gate_probability_heatmap.png",
+      "performance_bars": "/Users/mawei/MT202601/RSA-Guided Hybrid PINN/outputs/report_plots/performance_bars.png"
+    }
+  },
+  "models": {
+    "vanilla": {
+      "converge_steps": 2500,
+      "train_steps": 2500
+    },
+    "rhp": {
+      "converge_steps": 3000,
+      "train_steps": 3000
+    }
+  }
+}
