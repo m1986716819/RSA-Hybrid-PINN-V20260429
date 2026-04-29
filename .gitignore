@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Output (generated benchmark results)
+outputs/
+outputs_vf_30/
+
+# Archived test results (31MB, no need in git)
+test_result/
+
+# Checkpoints (model weights > 50MB)
+checkpoints/*.pth
+
+# Third-party
+third_party/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+nohup.out
+
+# Temp
+tmp_*.yaml
+temp_*
+
+# Python venv
+venv/
+.venv/

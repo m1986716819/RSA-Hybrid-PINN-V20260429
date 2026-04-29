@@ -26,6 +26,7 @@ from .solvers.physics_loss import (
     start_bc_loss,
     upwind_physics_loss,
 )
+from .solvers.pntfield_2d import PNTField2D, PNTField2DConfig
 from .solvers.rsa_engine import RSAEngine, RSAResult, extract_gateway_segment, sample_gate_band
 from .utils.sampler import apply_sdf_surface_boost, sample_adaptive_xy
 
@@ -128,7 +129,7 @@ def _make_env(cfg: Dict[str, Any], device: torch.device) -> Maze2DEnv:
     )
     if name == "u_maze":
         p = cfg["env"]["u_maze"]
-        return Maze2DEnv.make_u_maze(
+        env = Maze2DEnv.make_u_maze(
             **common,
             wall_thickness=float(p["wall_thickness"]),
             inner_gap=float(p["inner_gap"]),
@@ -136,15 +137,62 @@ def _make_env(cfg: Dict[str, Any], device: torch.device) -> Maze2DEnv:
             center=tuple(p.get("center", [0.0, 0.0])),
             rotation_deg=float(p.get("rotation_deg", 0.0)),
         )
-    if name == "narrow_passage":
+    elif name == "narrow_passage":
         p = cfg["env"]["narrow_passage"]
-        return Maze2DEnv.make_narrow_passage(
+        env = Maze2DEnv.make_narrow_passage(
             **common,
             passage_width=float(p["passage_width"]),
             block_width=float(p["block_width"]),
             block_height=float(p["block_height"]),
+            center=tuple(p.get("center", [0.0, 0.0])),
+            rotation_deg=float(p.get("rotation_deg", 0.0)),
         )
-    raise ValueError(f"Unknown env.name: {name}")
+    elif name == "trap_u_shape":
+        p = cfg["env"]["trap_u_shape"]
+        env = Maze2DEnv.make_trap_u_shape(
+            **common,
+            wall_thickness=float(p.get("wall_thickness", 0.03)),
+            left_x=float(p.get("left_x", 0.35)),
+            u_depth=float(p.get("u_depth", 0.28)),
+            u_height=float(p.get("u_height", 0.55)),
+            center_y=float(p.get("center_y", 0.5)),
+        )
+    elif name == "trap_heterogeneous_vf":
+        p = cfg["env"]["trap_heterogeneous_vf"]
+        env = Maze2DEnv.make_trap_heterogeneous_vf(
+            **common,
+            wall_thickness=float(p.get("wall_thickness", 0.03)),
+            left_x=float(p.get("left_x", 0.35)),
+            u_depth=float(p.get("u_depth", 0.28)),
+            u_height=float(p.get("u_height", 0.55)),
+            center_y=float(p.get("center_y", 0.5)),
+            v_slow=float(p.get("v_slow", 0.3)),
+            v_fast=float(p.get("v_fast", 1.0)),
+            sigmoid_beta=float(p.get("sigmoid_beta", 8.0)),
+        )
+    elif name == "open_space":
+        env = Maze2DEnv.make_open_space(**common)
+    else:
+        raise ValueError(f"Unknown env.name: {name}")
+
+    vf_cfg = cfg["env"].get("velocity_field", {})
+    if isinstance(vf_cfg, dict) and vf_cfg.get("enabled", False):
+        vf_type = str(vf_cfg.get("type", "half_space"))
+        if vf_type == "half_space":
+            v_upper = float(vf_cfg.get("v_upper", 1.0))
+            v_lower = float(vf_cfg.get("v_lower", 0.2))
+            boundary_y = float(vf_cfg.get("boundary_y", 0.0))
+            def _half_space_velocity(xy: torch.Tensor) -> torch.Tensor:
+                return torch.where(
+                    xy[:, 1] >= boundary_y,
+                    torch.full((xy.shape[0],), v_upper, device=xy.device, dtype=xy.dtype),
+                    torch.full((xy.shape[0],), v_lower, device=xy.device, dtype=xy.dtype),
+                )
+            env.set_velocity_field(_half_space_velocity)
+        else:
+            raise ValueError(f"Unknown velocity_field.type: {vf_type}")
+
+    return env
 
 
 def _grid_coords(bounds: Bounds2D, grid_size: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray]:
@@ -158,6 +206,93 @@ def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     mask = mask.to(dtype=x.dtype)
     denom = torch.mean(mask) + 1e-12
     return torch.mean(x * mask) / denom
+
+
+def _laplacian_smoothness_loss(model: torch.nn.Module, xy: torch.Tensor, env: Maze2DEnv) -> torch.Tensor:
+    xy_req = xy.clone().detach().requires_grad_(True)
+    pred = model(xy_req)[:, 0]
+    grad_xy = torch.autograd.grad(
+        outputs=pred.sum(),
+        inputs=xy_req,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    lap = torch.zeros_like(pred)
+    for dim in range(xy_req.shape[1]):
+        second = torch.autograd.grad(
+            outputs=grad_xy[:, dim].sum(),
+            inputs=xy_req,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0][:, dim]
+        lap = lap + second
+    lap = torch.clamp(lap, min=-10.0, max=10.0)
+    with torch.no_grad():
+        free_mask = (env.sdf(xy_req) >= 0.0).to(dtype=xy_req.dtype)
+    return _masked_mean(lap**2, free_mask)
+
+
+def _goal_bc_loss(model: torch.nn.Module, goal_xy: torch.Tensor) -> torch.Tensor:
+    if goal_xy.ndim == 1:
+        goal_xy = goal_xy.unsqueeze(0)
+    t_goal = model(goal_xy)
+    if t_goal.ndim == 2:
+        t_goal = t_goal[:, 0]
+    return torch.mean(t_goal**2)
+
+
+def _gradient_floor_loss(
+    model: torch.nn.Module,
+    xy: torch.Tensor,
+    env: Maze2DEnv,
+    grad_floor: float,
+) -> torch.Tensor:
+    xy_req = xy.clone().detach().requires_grad_(True)
+    pred = model(xy_req)[:, 0]
+    grad_xy = torch.autograd.grad(
+        outputs=pred.sum(),
+        inputs=xy_req,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    grad_norm = torch.sqrt(torch.sum(grad_xy**2, dim=-1) + 1e-12)
+    with torch.no_grad():
+        free_mask = (env.sdf(xy_req) >= 0.0).to(dtype=xy_req.dtype)
+    return _masked_mean(torch.relu(float(grad_floor) - grad_norm) ** 2, free_mask)
+
+
+def _distance_ranking_loss(
+    pred: torch.Tensor,
+    dist_to_goal: torch.Tensor,
+    free_mask: torch.Tensor,
+    margin: float,
+    rng: np.random.Generator,
+    max_pairs: int = 512,
+) -> torch.Tensor:
+    free_idx = torch.nonzero(free_mask > 0.5, as_tuple=False).squeeze(-1)
+    if free_idx.numel() < 2:
+        return torch.zeros((), device=pred.device, dtype=pred.dtype)
+    num_pairs = int(min(max_pairs, free_idx.numel() // 2))
+    if num_pairs <= 0:
+        return torch.zeros((), device=pred.device, dtype=pred.dtype)
+    idx_np = free_idx.detach().cpu().numpy()
+    i_idx = torch.from_numpy(rng.choice(idx_np, size=num_pairs, replace=True)).to(device=pred.device, dtype=torch.long)
+    j_idx = torch.from_numpy(rng.choice(idx_np, size=num_pairs, replace=True)).to(device=pred.device, dtype=torch.long)
+    dist_i = dist_to_goal[i_idx]
+    dist_j = dist_to_goal[j_idx]
+    pred_i = pred[i_idx]
+    pred_j = pred[j_idx]
+    farther = (dist_i > dist_j).to(dtype=pred.dtype)
+    nearer = (dist_j > dist_i).to(dtype=pred.dtype)
+    margin_t = torch.tensor(float(margin), device=pred.device, dtype=pred.dtype)
+    loss_farther = farther * torch.relu(margin_t - (pred_i - pred_j)) ** 2
+    loss_nearer = nearer * torch.relu(margin_t - (pred_j - pred_i)) ** 2
+    active = farther + nearer
+    denom = torch.mean(active) + 1e-12
+    return torch.mean(loss_farther + loss_nearer) / denom
 
 
 def _interp_vec_bilinear(
@@ -344,6 +479,7 @@ def _train_rhp(
     phcfg = tcfg.get("physics", {}) if isinstance(tcfg, dict) else {}
     physics_mode = str(phcfg.get("mode", "autograd")).lower()
     fd_step = float(phcfg.get("fd_step", 0.01))
+    training_speed_fn = env.wave_speed if env.has_velocity_field() else env.speed
 
     if rsa_path_xy.ndim != 2 or rsa_path_xy.shape[1] != 2:
         raise ValueError("rsa_path_xy must have shape [M,2]")
@@ -447,7 +583,7 @@ def _train_rhp(
             model=model,
             xy=xy,
             env_sdf_fn=env.sdf,
-            speed_fn=env.speed,
+            speed_fn=training_speed_fn,
             sdf_band=sdf_band,
             lambda_int=lambda_int,
             lambda_grad=lambda_grad,
@@ -490,14 +626,14 @@ def _train_rhp(
         lambda_phys_now = lambda_phys_start + (lambda_phys_end - lambda_phys_start) * progress
         lambda_phys_now = 0.8 * lambda_phys_now
         loss_phys_global = (
-            upwind_physics_loss(model=model, xy=xy_global, speed_fn=env.speed, fd_step=fd_step)
+            upwind_physics_loss(model=model, xy=xy_global, speed_fn=training_speed_fn, fd_step=fd_step)
             if physics_mode == "upwind"
-            else physics_loss(model=model, xy=xy_global, speed_fn=env.speed)
+            else physics_loss(model=model, xy=xy_global, speed_fn=training_speed_fn)
         )
         loss_phys_tube = (
-            upwind_physics_loss(model=model, xy=xy_tube, speed_fn=env.speed, fd_step=fd_step)
+            upwind_physics_loss(model=model, xy=xy_tube, speed_fn=training_speed_fn, fd_step=fd_step)
             if physics_mode == "upwind"
-            else physics_loss(model=model, xy=xy_tube, speed_fn=env.speed)
+            else physics_loss(model=model, xy=xy_tube, speed_fn=training_speed_fn)
         )
         loss_phys = loss_phys_global + 0.1 * loss_phys_tube
         loss_bc = start_bc_loss(model, start_t)
@@ -505,7 +641,7 @@ def _train_rhp(
             model=model,
             xy=xy,
             env_sdf_fn=env.sdf,
-            speed_fn=env.speed,
+            speed_fn=training_speed_fn,
             sdf_band=sdf_band,
             lambda_int=lambda_int,
             lambda_grad=lambda_grad,
@@ -720,6 +856,7 @@ def _train_rhp(
 def _train_vanilla_pinn(
     env: Maze2DEnv,
     start_xy: Tuple[float, float],
+    goal_xy: Tuple[float, float],
     cfg: Dict[str, Any],
     rng: np.random.Generator,
     device: torch.device,
@@ -733,6 +870,7 @@ def _train_vanilla_pinn(
     ).to(device=device)
     opt = torch.optim.Adam(model.parameters(), lr=float(tcfg["lr"]))
     start_t = torch.tensor(start_xy, dtype=torch.float32, device=device)
+    goal_t = torch.tensor(goal_xy, dtype=torch.float32, device=device)
     batch_size = int(tcfg["batch_size"])
 
     tol, patience, check_every = _get_convergence_cfg(cfg)
@@ -747,18 +885,51 @@ def _train_vanilla_pinn(
     lambda_vort = float(ocfg.get("lambda_vort", 20.0))
     sdf_scale = float(ocfg.get("sdf_scale", 10.0))
     lambda_obs = float(tcfg.get("lambda_obs", 1.0))
+    lambda_goal = float(tcfg.get("lambda_goal", 5.0))
     phcfg = tcfg.get("physics", {}) if isinstance(tcfg, dict) else {}
     physics_mode = str(phcfg.get("mode", "autograd")).lower()
     fd_step = float(phcfg.get("fd_step", 0.01))
+    max_steps = int(tcfg["max_steps"])
+    warmup_steps = int(tcfg.get("warmup_steps", 0))
+    curriculum_cfg = tcfg.get("curriculum", {}) if isinstance(tcfg, dict) else {}
+    phys_ramp_start = float(curriculum_cfg.get("phys_ramp_start", 0.3))
+    phys_ramp_end = float(curriculum_cfg.get("phys_ramp_end", 0.7))
+    phys_hold = float(curriculum_cfg.get("phys_hold", 1.5))
 
-    for step in range(int(tcfg["max_steps"])):
+    # Warmup: use Euclidean distance to goal as geometric supervision
+    for step in range(warmup_steps):
+        xy = env.sample_uniform(batch_size, rng=rng, device=device)
+        with torch.no_grad():
+            dist_target = torch.linalg.norm(xy - goal_t.view(1, 2), dim=-1)
+        pred = model(xy)[:, 0]
+        loss_geom = torch.mean((pred - dist_target) ** 2)
+        loss_goal_bc = start_bc_loss(model, goal_t)
+        loss = loss_geom + 5.0 * loss_goal_bc
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        train_steps += 1
+
+    # Curriculum: phase 1 = boundary-only, phase 2 = ramp physics, phase 3 = full
+    for step in range(max_steps):
+        progress = float(step + 1) / float(max(1, max_steps))
+        if progress < phys_ramp_start:
+            lambda_phys_now = 0.0
+            lambda_bc_scale = 3.0
+        elif progress < phys_ramp_end:
+            frac = (progress - phys_ramp_start) / (phys_ramp_end - phys_ramp_start + 1e-12)
+            lambda_phys_now = frac * float(tcfg.get("lambda_phys", 1.0))
+            lambda_bc_scale = 3.0 - 1.5 * frac
+        else:
+            lambda_phys_now = phys_hold * float(tcfg.get("lambda_phys", 1.0))
+            lambda_bc_scale = 1.5
         xy = env.sample_uniform(batch_size, rng=rng, device=device)
         loss_phys = (
             upwind_physics_loss(model=model, xy=xy, speed_fn=env.speed, fd_step=fd_step)
             if physics_mode == "upwind"
             else physics_loss(model=model, xy=xy, speed_fn=env.speed)
         )
-        loss_bc = start_bc_loss(model, start_t)
+        loss_goal_bc = start_bc_loss(model, goal_t)
         loss_obs = obstacle_loss(
             model=model,
             xy=xy,
@@ -772,12 +943,258 @@ def _train_vanilla_pinn(
             sdf_scale=sdf_scale,
         )
         loss = (
-            float(tcfg.get("lambda_phys", 1.0)) * loss_phys
-            + float(tcfg.get("lambda_bc", 5.0)) * loss_bc
+            float(lambda_phys_now) * loss_phys
+            + float(tcfg.get("lambda_bc", 5.0)) * lambda_bc_scale * loss_goal_bc
             + float(lambda_obs) * loss_obs
         )
         opt.zero_grad(set_to_none=True)
         loss.backward()
+        opt.step()
+        train_steps += 1
+
+        if check_every > 0 and ((step + 1) % check_every == 0):
+            if float(loss.detach().item()) <= tol:
+                ok_count += 1
+            else:
+                ok_count = 0
+            if ok_count >= patience:
+                converged_step = train_steps
+                break
+
+    if converged_step < 0:
+        converged_step = train_steps
+    return model, converged_step, train_steps
+
+
+def _train_pntfield_2d(
+    env: Maze2DEnv,
+    start_xy: Tuple[float, float],
+    goal_xy: Tuple[float, float],
+    cfg: Dict[str, Any],
+    rng: np.random.Generator,
+    device: torch.device,
+) -> Tuple[PNTField2D, int, int]:
+    mcfg = cfg["model"]
+    tcfg = cfg["train"]
+    pcfg = mcfg.get("pntfield_2d", {}) if isinstance(mcfg, dict) else {}
+    ptcfg = tcfg.get("pntfield_2d", {}) if isinstance(tcfg, dict) else {}
+    model = PNTField2D(
+        PNTField2DConfig(
+            hidden_dim=int(pcfg.get("hidden_dim", mcfg["hidden_dim"])),
+            num_blocks=int(pcfg.get("num_blocks", max(2, int(mcfg["num_layers"]) - 1))),
+            fourier_dim=int(pcfg.get("fourier_dim", 32)),
+            fourier_scale=float(pcfg.get("fourier_scale", 6.0)),
+            activation=str(pcfg.get("activation", "silu")),
+            # The pure neural baseline needs an exact zero-value goal boundary;
+            # allowing signed output avoids collapsing into a near-constant positive floor.
+            positive_output=False,
+        )
+    ).to(device=device)
+    opt = torch.optim.Adam(model.parameters(), lr=float(ptcfg.get("lr", tcfg["lr"])))
+    start_t = torch.tensor(start_xy, dtype=torch.float32, device=device)
+    goal_t = torch.tensor(goal_xy, dtype=torch.float32, device=device)
+    batch_size = int(ptcfg.get("batch_size", tcfg["batch_size"]))
+
+    tol, patience, check_every = _get_convergence_cfg(cfg)
+    ok_count = 0
+    converged_step = -1
+    train_steps = 0
+    ocfg = tcfg.get("obstacle", {}) if isinstance(tcfg, dict) else {}
+    sdf_band = float(ocfg.get("sdf_band", 0.05))
+    lambda_int = float(ocfg.get("lambda_int", 100.0))
+    lambda_grad = float(ocfg.get("lambda_grad", 10.0))
+    lambda_dir = float(ocfg.get("lambda_dir", 50.0))
+    lambda_vort = float(ocfg.get("lambda_vort", 20.0))
+    sdf_scale = float(ocfg.get("sdf_scale", 10.0))
+    lambda_obs_end = float(ptcfg.get("lambda_obs", tcfg.get("lambda_obs", 1.0)))
+    lambda_obs_start = float(ptcfg.get("lambda_obs_start", 0.25 * lambda_obs_end))
+    lambda_phys_end = float(ptcfg.get("lambda_phys", tcfg.get("lambda_phys", 1.0)))
+    lambda_phys_start = float(ptcfg.get("lambda_phys_start", 0.2 * lambda_phys_end))
+    lambda_visc_start = float(ptcfg.get("lambda_visc_start", 1e-3))
+    lambda_visc_end = float(ptcfg.get("lambda_visc_end", 1e-4))
+    lambda_geom_start = float(ptcfg.get("lambda_geom_start", 1.0))
+    lambda_geom_end = float(ptcfg.get("lambda_geom_end", 0.1))
+    lambda_start_anchor = float(ptcfg.get("lambda_start_anchor", 5.0))
+    lambda_dir_start = float(ptcfg.get("lambda_dir_start", 2.0))
+    lambda_dir_end = float(ptcfg.get("lambda_dir_end", 0.5))
+    alpha_dir = float(ptcfg.get("alpha_dir", 0.2))
+    grad_clip_norm = float(ptcfg.get("grad_clip_norm", 1.0))
+    lambda_goal = float(ptcfg.get("lambda_goal", 10.0))
+    warmup_steps = int(ptcfg.get("warmup_steps", 500))
+    lambda_antiflat_start = float(ptcfg.get("lambda_antiflat_start", 8.0))
+    lambda_antiflat_end = float(ptcfg.get("lambda_antiflat_end", 2.0))
+    grad_floor_start = float(ptcfg.get("grad_floor_start", 0.75))
+    grad_floor_end = float(ptcfg.get("grad_floor_end", 0.20))
+    lambda_rank_start = float(ptcfg.get("lambda_rank_start", 6.0))
+    lambda_rank_end = float(ptcfg.get("lambda_rank_end", 2.0))
+    rank_margin_start = float(ptcfg.get("rank_margin_start", 0.90))
+    rank_margin_end = float(ptcfg.get("rank_margin_end", 0.30))
+    lambda_warm_keep = float(ptcfg.get("lambda_warm_keep", 0.5))
+    lambda_start_value = float(ptcfg.get("lambda_start_value", 25.0))
+    lambda_shell = float(ptcfg.get("lambda_shell", 8.0))
+    lambda_phys_local = float(ptcfg.get("lambda_phys_local", 1.5))
+    lambda_global_rank_start = float(ptcfg.get("lambda_global_rank_start", 6.0))
+    lambda_global_rank_end = float(ptcfg.get("lambda_global_rank_end", 2.0))
+    global_rank_margin_start = float(ptcfg.get("global_rank_margin_start", 0.40))
+    global_rank_margin_end = float(ptcfg.get("global_rank_margin_end", 0.15))
+    phcfg = tcfg.get("physics", {}) if isinstance(tcfg, dict) else {}
+    physics_mode = str(phcfg.get("mode", "autograd")).lower()
+    fd_step = float(phcfg.get("fd_step", 0.01))
+    local_frac = float(ptcfg.get("local_frac", 0.15))
+    start_radius = float(ptcfg.get("start_radius", 0.18))
+    goal_radius = float(ptcfg.get("goal_radius", 0.12))
+    shell_radius = float(ptcfg.get("shell_radius", min(0.10, start_radius)))
+    shell_count = int(ptcfg.get("shell_count", 256))
+    lambda_visc_start *= 0.25
+    lambda_visc_end *= 0.25
+    lambda_obs_start *= 0.5
+    lambda_obs_end *= 0.5
+    # Supervised-first recovery stage: keep physics/obstacle weak until rollout becomes usable.
+    lambda_phys_start *= 0.2
+    lambda_phys_end *= 0.2
+    lambda_phys_local *= 0.2
+    lambda_obs_start *= 0.2
+    lambda_obs_end *= 0.2
+    grad_clip_norm = max(1.5, grad_clip_norm)
+    start_value_target = float(np.linalg.norm(np.asarray(start_xy, dtype=np.float32) - np.asarray(goal_xy, dtype=np.float32)))
+
+    def _sample_disk(center_xy: torch.Tensor, radius: float, count: int) -> torch.Tensor:
+        if count <= 0:
+            return torch.empty((0, 2), dtype=torch.float32, device=device)
+        ang = rng.uniform(0.0, 2.0 * np.pi, size=(count,)).astype(np.float32)
+        rad = np.sqrt(rng.uniform(0.0, 1.0, size=(count,)).astype(np.float32)) * float(radius)
+        center_np = center_xy.view(1, 2).detach().cpu().numpy().astype(np.float32)
+        pts = np.stack([np.cos(ang) * rad, np.sin(ang) * rad], axis=1).astype(np.float32) + center_np
+        return torch.from_numpy(pts).to(device=device, dtype=torch.float32)
+
+    def _sample_training_xy() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        n_local = int(min(batch_size // 3, max(64, round(batch_size * local_frac))))
+        n_global = int(max(1, batch_size - 2 * n_local))
+        xy_global = env.sample_uniform(n_global, rng=rng, device=device)
+        xy_start = _sample_disk(start_t, radius=start_radius, count=n_local)
+        xy_goal = _sample_disk(goal_t, radius=goal_radius, count=n_local)
+        return torch.cat([xy_global, xy_start, xy_goal], dim=0), xy_start, xy_goal
+
+    for _ in range(warmup_steps):
+        xy, _, _ = _sample_training_xy()
+        with torch.no_grad():
+            euclid_target = torch.linalg.norm(xy - goal_t.view(1, 2), dim=-1)
+        pred_xy = model(xy)[:, 0]
+        loss_warm = torch.mean((pred_xy - euclid_target) ** 2)
+        opt.zero_grad(set_to_none=True)
+        loss_warm.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+        opt.step()
+        train_steps += 1
+
+    for step in range(int(tcfg["max_steps"])):
+        xy, xy_start_local, xy_goal_local = _sample_training_xy()
+        progress = float(step + 1) / float(max(1, int(tcfg["max_steps"])))
+        lambda_phys_now = lambda_phys_start + (lambda_phys_end - lambda_phys_start) * progress
+        lambda_obs_now = lambda_obs_start + (lambda_obs_end - lambda_obs_start) * progress
+        lambda_visc_now = lambda_visc_start + (lambda_visc_end - lambda_visc_start) * progress
+        lambda_geom_now = lambda_geom_start + (lambda_geom_end - lambda_geom_start) * progress
+        lambda_dir_now = lambda_dir_start + (lambda_dir_end - lambda_dir_start) * progress
+        lambda_antiflat_now = lambda_antiflat_start + (lambda_antiflat_end - lambda_antiflat_start) * progress
+        grad_floor_now = grad_floor_start + (grad_floor_end - grad_floor_start) * progress
+        lambda_rank_now = lambda_rank_start + (lambda_rank_end - lambda_rank_start) * progress
+        rank_margin_now = rank_margin_start + (rank_margin_end - rank_margin_start) * progress
+        lambda_global_rank_now = lambda_global_rank_start + (lambda_global_rank_end - lambda_global_rank_start) * progress
+        global_rank_margin_now = global_rank_margin_start + (global_rank_margin_end - global_rank_margin_start) * progress
+        loss_phys = (
+            upwind_physics_loss(model=model, xy=xy, speed_fn=env.speed, fd_step=fd_step)
+            if physics_mode == "upwind"
+            else physics_loss(model=model, xy=xy, speed_fn=env.speed)
+        )
+        loss_phys_local = (
+            upwind_physics_loss(model=model, xy=xy_start_local, speed_fn=env.speed, fd_step=fd_step)
+            if physics_mode == "upwind"
+            else physics_loss(model=model, xy=xy_start_local, speed_fn=env.speed)
+        )
+        loss_bc = start_bc_loss(model, goal_t)
+        loss_obs = obstacle_loss(
+            model=model,
+            xy=xy,
+            env_sdf_fn=env.sdf,
+            speed_fn=env.speed,
+            sdf_band=sdf_band,
+            lambda_int=lambda_int,
+            lambda_grad=lambda_grad,
+            lambda_dir=lambda_dir,
+            lambda_vort=lambda_vort,
+            sdf_scale=sdf_scale,
+        )
+        loss_visc = _laplacian_smoothness_loss(model=model, xy=xy, env=env)
+        with torch.no_grad():
+            free_mask = (env.sdf(xy) >= 0.0).to(dtype=xy.dtype)
+            euclid_target = torch.linalg.norm(xy - goal_t.view(1, 2), dim=-1)
+        pred_xy = model(xy)[:, 0]
+        loss_geom = _masked_mean((pred_xy - euclid_target) ** 2, free_mask)
+        with torch.no_grad():
+            start_free = (env.sdf(xy_start_local) >= 0.0).to(dtype=xy_start_local.dtype)
+            start_target = torch.linalg.norm(xy_start_local - goal_t.view(1, 2), dim=-1)
+            goal_free = (env.sdf(xy_goal_local) >= 0.0).to(dtype=xy_goal_local.dtype)
+        pred_start = model(xy_start_local)[:, 0]
+        loss_start_anchor = _masked_mean((pred_start - start_target) ** 2, start_free)
+        pred_goal_local = model(xy_goal_local)[:, 0]
+        loss_goal_local = _masked_mean(pred_goal_local**2, goal_free)
+        shell_xy = _sample_disk(start_t, radius=shell_radius, count=shell_count)
+        with torch.no_grad():
+            shell_free = (env.sdf(shell_xy) >= 0.0).to(dtype=shell_xy.dtype)
+            shell_target = torch.linalg.norm(shell_xy - goal_t.view(1, 2), dim=-1)
+        pred_shell = model(shell_xy)[:, 0]
+        loss_shell = _masked_mean((pred_shell - shell_target) ** 2, shell_free)
+        pred_start_exact = model(start_t.view(1, 2))[:, 0]
+        start_target_exact = torch.full_like(pred_start_exact, start_value_target)
+        loss_start_value = torch.mean((pred_start_exact - start_target_exact) ** 2)
+        loss_warm_keep = loss_start_anchor + loss_goal_local + 0.5 * loss_shell + 0.25 * loss_geom
+        loss_antiflat = _gradient_floor_loss(
+            model=model,
+            xy=xy_start_local,
+            env=env,
+            grad_floor=grad_floor_now,
+        )
+        mean_start = _masked_mean(pred_start, start_free)
+        mean_goal = _masked_mean(pred_goal_local, goal_free)
+        loss_rank = torch.relu(float(rank_margin_now) - (mean_start - mean_goal)) ** 2
+        loss_global_rank = _distance_ranking_loss(
+            pred=pred_xy,
+            dist_to_goal=euclid_target,
+            free_mask=free_mask,
+            margin=global_rank_margin_now,
+            rng=rng,
+            max_pairs=512,
+        )
+        local_xy = xy_start_local
+        with torch.no_grad():
+            d_goal_local = goal_t.view(1, 2) - local_xy
+            d_goal_local = d_goal_local / (torch.linalg.norm(d_goal_local, dim=-1, keepdim=True) + 1e-12)
+        loss_dir_geom = loss_monotonicity(
+            model=model,
+            xy=local_xy,
+            d_target=d_goal_local,
+            env_sdf_fn=env.sdf,
+            alpha=alpha_dir,
+        )
+        loss = (
+            float(lambda_phys_now) * loss_phys
+            + float(lambda_phys_local) * loss_phys_local
+            + float(lambda_goal) * loss_bc
+            + float(lambda_obs_now) * loss_obs
+            + float(lambda_visc_now) * loss_visc
+            + float(lambda_geom_now) * loss_geom
+            + float(lambda_start_anchor) * loss_start_anchor
+            + float(lambda_start_value) * loss_start_value
+            + float(lambda_shell) * loss_shell
+            + float(lambda_warm_keep) * loss_warm_keep
+            + float(lambda_antiflat_now) * loss_antiflat
+            + float(lambda_rank_now) * loss_rank
+            + float(lambda_global_rank_now) * loss_global_rank
+            + float(lambda_dir_now) * loss_dir_geom
+        )
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
         opt.step()
         train_steps += 1
 
@@ -809,17 +1226,41 @@ def _summarize(metrics_all: List[Dict[str, EvalMetrics]]) -> Dict[str, Dict[str,
             [m[name].converge_steps if m[name].converge_steps is not None else np.nan for m in metrics_all],
             dtype=np.float32,
         )
+        time_cost_arr = np.asarray(
+            [m[name].time_cost if np.isfinite(m[name].time_cost) else np.nan for m in metrics_all],
+            dtype=np.float32,
+        )
+        eff_arr = np.asarray(
+            [m[name].efficiency_ratio if np.isfinite(m[name].efficiency_ratio) else np.nan for m in metrics_all],
+            dtype=np.float32,
+        )
+        phys_arr = np.asarray(
+            [m[name].physical_consistency if np.isfinite(m[name].physical_consistency) else np.nan for m in metrics_all],
+            dtype=np.float32,
+        )
+        curv_arr = np.asarray(
+            [m[name].curvature_sharpness if np.isfinite(m[name].curvature_sharpness) else np.nan for m in metrics_all],
+            dtype=np.float32,
+        )
         gap = np.where(np.isfinite(gap), gap, np.nan)
         gns = np.where(np.isfinite(gns), gns, np.nan)
         csteps = np.where(np.isfinite(csteps), csteps, np.nan)
         gap_mean = float(np.nanmean(gap)) if np.any(np.isfinite(gap)) else float("nan")
         gns_mean = float(np.nanmean(gns)) if np.any(np.isfinite(gns)) else float("nan")
         csteps_mean = float(np.nanmean(csteps)) if np.any(np.isfinite(csteps)) else float("nan")
+        time_cost_mean = float(np.nanmean(time_cost_arr)) if np.any(np.isfinite(time_cost_arr)) else float("nan")
+        eff_mean = float(np.nanmean(eff_arr)) if np.any(np.isfinite(eff_arr)) else float("nan")
+        phys_mean = float(np.nanmean(phys_arr)) if np.any(np.isfinite(phys_arr)) else float("nan")
+        curv_mean = float(np.nanmean(curv_arr)) if np.any(np.isfinite(curv_arr)) else float("nan")
         out[name] = {
             "SR_mean": float(np.mean(success)),
             "OptimalityGap_mean": gap_mean,
             "GradNormStart_mean": gns_mean,
             "ConvergeSteps_mean": csteps_mean,
+            "TimeCost_mean": time_cost_mean,
+            "EfficiencyRatio_mean": eff_mean,
+            "PhysicalConsistency_mean": phys_mean,
+            "CurvatureSharpness_mean": curv_mean,
         }
     return out
 
@@ -892,7 +1333,8 @@ def run(cfg: Dict[str, Any]) -> Dict[str, Any]:
             boost=float(cfg["train"].get("gate", {}).get("weight_boost", 2.0)),
         )
 
-        vanilla, vanilla_conv, vanilla_steps = _train_vanilla_pinn(env, start_xy, cfg, rng, device=device)
+        vanilla, vanilla_conv, vanilla_steps = _train_vanilla_pinn(env, start_xy, goal_xy, cfg, rng, device=device)
+        pntfield, pntfield_conv, pntfield_steps = _train_pntfield_2d(env, start_xy, goal_xy, cfg, rng, device=device)
         rhp, rhp_conv, rhp_steps = _train_rhp(
             env,
             start_xy,
@@ -910,7 +1352,7 @@ def run(cfg: Dict[str, Any]) -> Dict[str, Any]:
             device=device,
         )
 
-        models = {"vanilla_pinn": vanilla, "rhp_pinn": rhp}
+        models = {"vanilla_pinn": vanilla, "pntfield_2d": pntfield, "rhp_pinn": rhp}
         metrics, paths = evaluate_methods(
             env=env,
             start_xy=start_xy,
@@ -936,6 +1378,10 @@ def run(cfg: Dict[str, Any]) -> Dict[str, Any]:
             grad_norm_start=metrics["vanilla_pinn"].grad_norm_start,
             converge_steps=int(vanilla_conv),
             train_steps=int(vanilla_steps),
+            time_cost=metrics["vanilla_pinn"].time_cost,
+            efficiency_ratio=metrics["vanilla_pinn"].efficiency_ratio,
+            physical_consistency=metrics["vanilla_pinn"].physical_consistency,
+            curvature_sharpness=metrics["vanilla_pinn"].curvature_sharpness,
         )
         metrics["rhp_pinn"] = EvalMetrics(
             success=metrics["rhp_pinn"].success,
@@ -948,11 +1394,32 @@ def run(cfg: Dict[str, Any]) -> Dict[str, Any]:
             grad_norm_start=metrics["rhp_pinn"].grad_norm_start,
             converge_steps=int(rhp_conv),
             train_steps=int(rhp_steps),
+            time_cost=metrics["rhp_pinn"].time_cost,
+            efficiency_ratio=metrics["rhp_pinn"].efficiency_ratio,
+            physical_consistency=metrics["rhp_pinn"].physical_consistency,
+            curvature_sharpness=metrics["rhp_pinn"].curvature_sharpness,
+        )
+        metrics["pntfield_2d"] = EvalMetrics(
+            success=metrics["pntfield_2d"].success,
+            length=metrics["pntfield_2d"].length,
+            smoothness=metrics["pntfield_2d"].smoothness,
+            optimality_gap=metrics["pntfield_2d"].optimality_gap,
+            regret=metrics["pntfield_2d"].regret,
+            gating_ratio=metrics["pntfield_2d"].gating_ratio,
+            gating_efficiency=metrics["pntfield_2d"].gating_efficiency,
+            grad_norm_start=metrics["pntfield_2d"].grad_norm_start,
+            converge_steps=int(pntfield_conv),
+            train_steps=int(pntfield_steps),
+            time_cost=metrics["pntfield_2d"].time_cost,
+            efficiency_ratio=metrics["pntfield_2d"].efficiency_ratio,
+            physical_consistency=metrics["pntfield_2d"].physical_consistency,
+            curvature_sharpness=metrics["pntfield_2d"].curvature_sharpness,
         )
         metrics_all.append(metrics)
 
         if bool(cfg["eval"].get("save_plots", True)) and (s == 0):
             out_path = os.path.join(out_dir, f"fields_paths_seed{int(cfg.get('seed', 0))}.png")
+            v_grid = env.velocity_grid(tuple(cfg["rsa"]["grid_size"]))
             save_field_and_paths_plot(
                 env=env,
                 rsa=rsa_low,
@@ -961,6 +1428,7 @@ def run(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 models=models,
                 paths=paths,
                 out_path=out_path,
+                velocity_grid=v_grid,
             )
             max_len = float(cfg["eval"]["path_step"]) * float(cfg["eval"]["max_path_steps"])
             if (not metrics["rhp_pinn"].success) and (float(metrics["rhp_pinn"].length) >= 0.98 * max_len):

@@ -552,7 +552,7 @@ def generate_report(
         diff_weight=float(cfg["train"].get("gate", {}).get("diff_weight", 1.0)),
     )
 
-    vanilla, vanilla_conv, vanilla_steps = _train_vanilla_pinn(env, start_xy, cfg, rng, device=device)
+    vanilla, vanilla_conv, vanilla_steps = _train_vanilla_pinn(env, start_xy, goal_xy, cfg, rng, device=device)
     rhp, rhp_conv, rhp_steps = _train_rhp(
         env,
         start_xy,

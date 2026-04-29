@@ -162,6 +162,37 @@ def _exit_confidence(
     return float(min(open_score, low_block_score, align_score, max(progress_score, path_score)))
 
 
+def _stable_gate_value(value: float) -> float:
+    if not np.isfinite(value):
+        return float("inf")
+    return float(np.sign(value) * np.log1p(abs(float(value))))
+
+
+def _pinn_tolerant_gate_value(value: float, tolerance: float = 1.2) -> float:
+    val = _stable_gate_value(value)
+    tol = max(1.0, float(tolerance))
+    if not np.isfinite(val):
+        return val
+    return float(val / tol) if val >= 0.0 else float(val * tol)
+
+
+def _goal_line_of_sight(
+    env: Maze2DEnv,
+    cur_xy: np.ndarray,
+    goal_xy: Tuple[float, float],
+    samples: int = 20,
+) -> bool:
+    n = int(max(4, samples))
+    goal = np.asarray(goal_xy, dtype=np.float32).reshape(1, 2)
+    cur = np.asarray(cur_xy, dtype=np.float32).reshape(1, 2)
+    alphas = np.linspace(0.0, 1.0, n + 2, dtype=np.float32)[1:-1].reshape(-1, 1)
+    pts = (1.0 - alphas) * cur + alphas * goal
+    pts_t = torch.from_numpy(pts.astype(np.float32)).to(device=env.device)
+    with torch.no_grad():
+        free = env.is_free(pts_t).detach().cpu().numpy().astype(np.float32)
+    return bool(np.all(free > 0.5))
+
+
 def path_length(path_xy: np.ndarray) -> float:
     if path_xy.shape[0] < 2:
         return float("inf")
@@ -182,6 +213,62 @@ def path_smoothness(path_xy: np.ndarray) -> float:
     return float(np.mean(np.abs(ang)))
 
 
+def path_time_cost(path_xy: np.ndarray, velocity_field_np_fn=None) -> float:
+    if path_xy.shape[0] < 2:
+        return float("inf")
+    if velocity_field_np_fn is None:
+        return path_length(path_xy)
+    total = 0.0
+    for i in range(path_xy.shape[0] - 1):
+        seg = path_xy[i + 1] - path_xy[i]
+        ds = float(np.linalg.norm(seg))
+        mid = (path_xy[i] + path_xy[i + 1]) * 0.5
+        v = float(velocity_field_np_fn(mid))
+        if v > 1e-8:
+            total += ds / v
+        else:
+            return float("inf")
+    return total
+
+
+def path_eikonal_residual(
+    path_xy: np.ndarray,
+    model: torch.nn.Module,
+    env: Maze2DEnv,
+    n_samples: int = 100,
+) -> float:
+    if path_xy.shape[0] < 3:
+        return float("nan")
+    n = min(n_samples, path_xy.shape[0])
+    idx = np.linspace(0, path_xy.shape[0] - 1, n, dtype=np.int64)
+    device = next(model.parameters()).device
+    xy = torch.from_numpy(path_xy[idx].astype(np.float32)).to(device=device)
+    xy.requires_grad_(True)
+    t = model(xy)
+    if t.ndim == 2:
+        t = t[:, 0]
+    grad = torch.autograd.grad(t.sum(), xy, create_graph=False, retain_graph=False)[0]
+    grad_norm = torch.sqrt(torch.sum(grad**2, dim=-1) + 1e-12)
+    with torch.no_grad():
+        speed_val = env.wave_speed(xy.detach())
+        inv_speed = 1.0 / torch.clamp(speed_val, min=1e-6)
+    residual = torch.abs(grad_norm - inv_speed).mean().detach().cpu().item()
+    return float(residual)
+
+
+def path_curvature(path_xy: np.ndarray) -> Tuple[float, float, float]:
+    if path_xy.shape[0] < 4:
+        return (float("nan"), float("nan"), float("nan"))
+    v = path_xy[1:] - path_xy[:-1]
+    speed = np.linalg.norm(v, axis=1)
+    a = v[1:] - v[:-1]
+    accel = np.linalg.norm(a, axis=1)
+    speed_trough = float(np.percentile(speed, 10))
+    sharpness = float(np.percentile(accel, 90))
+    avg_accel = float(np.mean(accel))
+    return (speed_trough, sharpness, avg_accel)
+
+
 def integrate_path_by_grad(
     model: torch.nn.Module,
     env: Maze2DEnv,
@@ -195,6 +282,7 @@ def integrate_path_by_grad(
     goal_attract_eps: float = 0.05,
     strict_goal_tol: bool = False,
     use_gating: bool = True,
+    use_pure_rollout_stabilizer: bool = False,
 ) -> Tuple[np.ndarray, bool, float]:
     device = next(model.parameters()).device
     _ = rsa_field, goal_attract_eps
@@ -211,6 +299,10 @@ def integrate_path_by_grad(
     last_path_idx = 0
     stall_steps = 0
     progress_stall_count = 0
+    pure_step_scale = 1.0
+    pure_stall_count = 0
+    prev_move_dir: Optional[torch.Tensor] = None
+    pinn_confidence_counter = 0
     rsa_streak = 0
     rsa_exit_cooldown = 0
     gate_recenter_countdown = 0
@@ -247,13 +339,16 @@ def integrate_path_by_grad(
         nrm = torch.linalg.norm(sdf_grad, dim=-1, keepdim=True) + 1e-12
         return sdf_grad / nrm
 
-    def _line_search(x_cur: torch.Tensor, v_dir: torch.Tensor) -> Tuple[torch.Tensor, bool, bool]:
+    def _normalize(v: torch.Tensor) -> torch.Tensor:
+        return v / (torch.linalg.norm(v, dim=-1, keepdim=True) + 1e-12)
+
+    def _line_search(x_cur: torch.Tensor, v_dir: torch.Tensor, step_scale: float = 1.0) -> Tuple[torch.Tensor, bool, bool]:
         used_backtrack = False
         for i in range(0, 6):
             if i == 0:
-                h = float(step_size)
+                h = float(step_size) * float(step_scale)
             else:
-                h = float(step_size) * (0.5**i)
+                h = float(step_size) * float(step_scale) * (0.5**i)
                 used_backtrack = True
             x_try = x_cur + h * v_dir
             with torch.no_grad():
@@ -262,16 +357,21 @@ def integrate_path_by_grad(
                 return x_try, True, used_backtrack
         return x_cur, False, used_backtrack
 
-    def _candidate_step(x_cur: torch.Tensor, v_dir: torch.Tensor, sdf_grad_cur: torch.Tensor) -> Tuple[torch.Tensor, bool, bool, bool]:
-        x_next, ok_free, used_backtrack = _line_search(x_cur, v_dir)
+    def _candidate_step(
+        x_cur: torch.Tensor,
+        v_dir: torch.Tensor,
+        sdf_grad_cur: torch.Tensor,
+        step_scale: float = 1.0,
+    ) -> Tuple[torch.Tensor, bool, bool, bool]:
+        x_next, ok_free, used_backtrack = _line_search(x_cur, v_dir, step_scale=step_scale)
         used_slide = False
         if ok_free:
             return x_next, True, used_backtrack, used_slide
         n = _sdf_normal(sdf_grad_cur.detach())
         dot = torch.sum(v_dir * n, dim=-1, keepdim=True)
         v_slide = v_dir - dot * n
-        v_slide = v_slide / (torch.linalg.norm(v_slide, dim=-1, keepdim=True) + 1e-12)
-        x_next, ok_free2, used_backtrack2 = _line_search(x_cur, v_slide)
+        v_slide = _normalize(v_slide)
+        x_next, ok_free2, used_backtrack2 = _line_search(x_cur, v_slide, step_scale=step_scale)
         return x_next, bool(ok_free2), bool(used_backtrack or used_backtrack2), bool(ok_free2)
 
     def _predict_value(hist_items: list[np.ndarray]) -> float:
@@ -395,8 +495,58 @@ def integrate_path_by_grad(
         gnorm = torch.linalg.norm(grad_t, dim=-1, keepdim=True) + 1e-12
         v_pinn = -grad_t / gnorm
         if gating_model is None:
-            v = v_pinn
-            x_next, ok_free, used_backtrack, used_slide = _candidate_step(x, v, grad_sdf)
+            if bool(use_pure_rollout_stabilizer):
+                cur_xy_np = x.detach().cpu().numpy()[0].astype(np.float32)
+                goal_dir_np = (np.asarray(goal_xy, dtype=np.float32) - cur_xy_np).astype(np.float32)
+                goal_dir_np = goal_dir_np / (float(np.linalg.norm(goal_dir_np)) + 1e-12)
+                goal_dir_t = torch.tensor(goal_dir_np, dtype=torch.float32, device=device).view(1, 2)
+                v = v_pinn
+                if prev_move_dir is not None:
+                    align_prev = float(torch.sum(v * prev_move_dir, dim=-1).item())
+                    blend_prev = 0.55 if align_prev > -0.1 else 0.80
+                    v = _normalize((1.0 - blend_prev) * v + blend_prev * prev_move_dir)
+                v = _normalize(0.85 * v + 0.15 * goal_dir_t)
+                x_next, ok_free, used_backtrack, used_slide = _candidate_step(
+                    x,
+                    v,
+                    grad_sdf,
+                    step_scale=pure_step_scale,
+                )
+                bounce_detected = False
+                if len(pts) >= 2:
+                    prev2 = np.asarray(pts[-2], dtype=np.float32)
+                    bounce_detected = float(np.linalg.norm(x_next.detach().cpu().numpy()[0] - prev2)) < 0.6 * float(step_size)
+                cur_dist = float(torch.linalg.norm(x - goal).item())
+                next_dist = float(torch.linalg.norm(x_next - goal).item())
+                poor_progress = next_dist > cur_dist - 0.10 * float(step_size)
+                if bounce_detected or poor_progress:
+                    pure_stall_count += 1
+                else:
+                    pure_stall_count = 0
+                if pure_stall_count >= 2:
+                    rescue_dir = _normalize(0.55 * goal_dir_t + 0.30 * v_pinn + 0.15 * v)
+                    rescue_scale = max(0.35, pure_step_scale * 0.75)
+                    x_rescue, ok_rescue, used_backtrack_rescue, used_slide_rescue = _candidate_step(
+                        x,
+                        rescue_dir,
+                        grad_sdf,
+                        step_scale=rescue_scale,
+                    )
+                    if ok_rescue:
+                        rescue_dist = float(torch.linalg.norm(x_rescue - goal).item())
+                        if (not ok_free) or (rescue_dist < next_dist):
+                            x_next = x_rescue
+                            ok_free = ok_rescue
+                            used_backtrack = used_backtrack_rescue
+                            used_slide = used_slide_rescue
+                            v = rescue_dir
+                            next_dist = rescue_dist
+                    pure_step_scale = max(0.35, pure_step_scale * 0.80)
+                elif not poor_progress:
+                    pure_step_scale = min(1.0, pure_step_scale * 1.02)
+            else:
+                v = v_pinn
+                x_next, ok_free, used_backtrack, used_slide = _candidate_step(x, v, grad_sdf)
             if used_backtrack:
                 backtrack_steps += 1
             if used_slide:
@@ -415,6 +565,8 @@ def integrate_path_by_grad(
                 if torch.linalg.norm(x_next - goal).item() <= goal_threshold:
                     pts.append(x_next.detach().cpu().numpy()[0])
                     return _finalize(True)
+            if bool(use_pure_rollout_stabilizer):
+                prev_move_dir = _normalize(x_next - x).detach()
             x = x_next
             pts.append(x.detach().cpu().numpy()[0])
             continue
@@ -441,8 +593,16 @@ def integrate_path_by_grad(
         d_goal_np = (np.asarray(goal_xy, dtype=np.float32) - cur_xy_np).astype(np.float32)
         d_goal_np = (d_goal_np / (float(np.linalg.norm(d_goal_np)) + 1e-12)).astype(np.float32)
         goal_align = float(np.dot(d_pinn_np, d_goal_np))
+        pinn_monotonicity = float(np.dot(d_pinn_np, d_look_np))
         dist_goal = float(np.linalg.norm(np.asarray(goal_xy, dtype=np.float32) - cur_xy_np))
+        goal_visible = _goal_line_of_sight(env=env, cur_xy=cur_xy_np, goal_xy=goal_xy)
         blockage = _local_blockage(env=env, cur_xy=cur_xy_np)
+        near_goal_anchor = bool(
+            dist_goal < 0.48
+            and goal_visible
+            and blockage < 0.12
+            and sdf_curr > 0.10
+        )
         goal_hist.append(dist_goal)
         progress_5, progress_norm, trend, progress_stall_count = _progress_features(
             list(goal_hist),
@@ -489,22 +649,55 @@ def integrate_path_by_grad(
             value_pinn, exit_conf_pinn, sdf_pinn, goal_align_pinn = _candidate_value(x_pinn)
         if ok_rsa:
             value_rsa, _, _, _ = _candidate_value(x_rsa)
+        pinn_release_metric = float(pinn_monotonicity)
+        if near_goal_anchor and ok_pinn:
+            pinn_release_metric = max(
+                float(pinn_release_metric),
+                float(goal_align_pinn),
+                float(exit_conf_pinn),
+            )
+        if pinn_release_metric > 0.5:
+            pinn_confidence_counter += 1
+        else:
+            pinn_confidence_counter = 0
+        pinn_release_ready = bool(pinn_confidence_counter >= 3)
+        autonomy_bias = bool(
+            path_progress > 0.55
+            and d_path < 0.055
+            and sdf_curr > 0.22
+            and blockage < 0.12
+            and (goal_align > 0.70 or exit_conf > 0.35)
+        )
+        entry_autonomy_probe = bool(
+            path_progress < 0.35
+            and d_path < 0.02
+            and sdf_curr > 0.19
+            and blockage < 0.06
+            and goal_align > 0.45
+        )
+        gate_value_pinn = _pinn_tolerant_gate_value(value_pinn, tolerance=1.2)
+        gate_value_rsa = _stable_gate_value(value_rsa)
         if sdf_curr < 0.15 or blockage > 0.6:
             current_factor = 1.0
         elif exit_conf > 0.3 or path_progress > 0.8:
             current_factor = 0.4
         else:
             current_factor = 0.95
-        rsa_value_gate = bool(ok_rsa and ok_pinn and value_rsa < value_pinn * current_factor)
+        if near_goal_anchor:
+            current_factor = min(current_factor, 0.25)
+        gate_margin = float(0.10 * (1.0 - current_factor))
+        rsa_value_gate = bool(ok_rsa and ok_pinn and gate_value_rsa < gate_value_pinn - gate_margin)
 
         if sdf_curr < 0.05 and ok_rsa:
             use_rsa = True
         elif ok_pinn and ok_rsa:
-            score_pinn = float(value_pinn)
-            score_rsa = float(value_rsa)
+            score_pinn = float(gate_value_pinn)
+            score_rsa = float(gate_value_rsa)
             if sdf_pinn > 0.18 and goal_align_pinn > 0.75:
                 score_pinn -= float(0.5 + exit_conf_pinn)
                 score_rsa += float(0.25 + 0.75 * exit_conf_pinn)
+            if near_goal_anchor:
+                score_rsa += 0.45
             use_rsa = bool(rsa_value_gate and (score_rsa < score_pinn))
         elif ok_rsa:
             use_rsa = True
@@ -517,7 +710,9 @@ def integrate_path_by_grad(
                 rsa_bonus += 1.0
             elif blockage > 0.10:
                 rsa_bonus += 0.35
-            if progress_stall_count >= 2:
+            if progress_stall_count >= 5:
+                rsa_bonus += 2.5
+            elif progress_stall_count >= 2:
                 rsa_bonus += 0.75
             if stall_steps >= stall_bias_trigger and d_path < 0.03:
                 rsa_bonus += 1.5
@@ -529,14 +724,26 @@ def integrate_path_by_grad(
                 rsa_bonus += 0.75
             if rsa_streak >= 16 and d_path < 0.04:
                 rsa_bonus += 1.5
-            score_pinn = float(value_pinn)
-            score_rsa = float(value_rsa - rsa_bonus)
+            if autonomy_bias:
+                rsa_bonus -= 0.9
+            if entry_autonomy_probe and gate_value_pinn + 0.04 < gate_value_rsa:
+                rsa_bonus -= 1.1
+            score_pinn = float(gate_value_pinn)
+            score_rsa = float(gate_value_rsa - rsa_bonus)
             if sdf_pinn > 0.18 and goal_align_pinn > 0.75:
                 score_pinn -= float(0.5 + exit_conf_pinn)
                 score_rsa += float(0.25 + 0.75 * exit_conf_pinn)
+            if near_goal_anchor:
+                score_rsa += 0.45
             use_rsa = bool(rsa_value_gate and (score_rsa < score_pinn))
         gate_entry_protect = bool(
             ok_rsa
+            and not near_goal_anchor
+            and not (
+                entry_autonomy_probe
+                and ok_pinn
+                and gate_value_pinn + 0.04 < gate_value_rsa
+            )
             and path_progress < 0.72
             and (
                 (
@@ -544,7 +751,6 @@ def integrate_path_by_grad(
                     and (
                         sdf_curr < 0.24
                         or blockage > 0.08
-                        or rsa_streak > 0
                         or progress_stall_count > 0
                     )
                 )
@@ -552,14 +758,14 @@ def integrate_path_by_grad(
                     path_progress < 0.62
                     and d_path < 0.09
                     and sdf_curr < 0.28
-                    and value_rsa <= value_pinn + 0.35
+                    and gate_value_rsa <= gate_value_pinn + 0.12
                 )
                 or (
                     path_progress < 0.72
                     and d_path < 0.04
                     and sdf_curr < 0.30
                     and exit_conf < 0.20
-                    and value_rsa <= value_pinn + 1.20
+                    and gate_value_rsa <= gate_value_pinn + 0.35
                 )
             )
         )
@@ -569,36 +775,49 @@ def integrate_path_by_grad(
         gate_recenter_protect = bool(
             gate_recenter_countdown > 0
             and ok_rsa
+            and not autonomy_bias
+            and not entry_autonomy_probe
             and path_progress < 0.68
             and 0.04 < d_path < 0.075
             and sdf_curr < 0.24
             and blockage < 0.18
             and exit_conf < 0.18
-            and value_rsa <= value_pinn + 0.10
+            and gate_value_rsa <= gate_value_pinn + 0.06
         )
         if gate_recenter_protect:
             use_rsa = True
         gate_mid_rescue = bool(
             ok_rsa
+            and not near_goal_anchor
             and path_progress < 0.95
             and d_path > 0.16
             and sdf_curr < 0.34
-            and value_rsa + 0.05 < value_pinn
+            and (
+                gate_value_rsa + 0.02 < gate_value_pinn
+                or pinn_monotonicity < 0.15
+                or goal_align_pinn < 0.25
+            )
         )
         if gate_mid_rescue:
             use_rsa = True
         gate_late_rescue = bool(
             ok_rsa
+            and not near_goal_anchor
             and path_progress < 0.82
             and 0.20 < d_path < 0.42
             and sdf_curr < 0.22
             and blockage < 0.28
-            and value_rsa + 0.20 < value_pinn
+            and (
+                gate_value_rsa + 0.08 < gate_value_pinn
+                or pinn_monotonicity < 0.10
+                or goal_align_pinn < 0.15
+            )
         )
         if gate_late_rescue:
             use_rsa = True
         gate_hard_rescue = bool(
             ok_rsa
+            and not near_goal_anchor
             and path_progress < 0.95
             and d_path > 0.34
             and sdf_curr < 0.08
@@ -607,21 +826,52 @@ def integrate_path_by_grad(
             use_rsa = True
         if ok_rsa and stall_steps >= stall_force_trigger and d_path < 0.03 and (not ok_pinn or rsa_value_gate):
             use_rsa = True
+        # Cooldown: every 15 consecutive RSA steps, force one PINN try.
+        # Only release if PINN gradient roughly points toward the goal.
+        if use_rsa and rsa_streak >= 15 and ok_pinn and sdf_curr > 0.05:
+            pinn_goal_cos = float(np.dot(d_pinn_np, d_goal_np))
+            if pinn_goal_cos > 0.1 or rsa_streak > 25:
+                use_rsa = False
+        # Velocity field autonomy: when velocity is non-uniform and PINN
+        # points toward the fast region, let PINN take over to find a
+        # time-optimal path that RSA's geometric shortest path misses.
+        vf_active = env.has_velocity_field()
+        if vf_active and ok_pinn and not near_goal_anchor and path_progress > 0.25:
+            d_pinn_np_2d = v_pinn.detach().cpu().numpy()[0]
+            # Upward direction (y > 0) leads to fast zone (V=1.0) in our setup
+            upness = float(d_pinn_np_2d[1])
+            vf_advantage = bool(
+                upness > 0.15
+                and sdf_pinn > 0.05
+                and goal_align_pinn > 0.35
+                and blockage < 0.20
+                and gate_value_pinn < gate_value_rsa + 0.10
+            )
+            if vf_advantage and (pinn_confidence_counter >= 1 or path_progress > 0.50):
+                use_rsa = False
         gate_release = bool(
-            ok_pinn
-            and path_progress > 0.45
-            and d_path < 0.05
+            pinn_release_ready
+            and ok_pinn
+            and (path_progress > 0.60 or near_goal_anchor)
+            and d_path < 0.035
             and sdf_curr > 0.20
             and blockage < 0.15
+            and pinn_release_metric > 0.55
             and (
                 exit_conf_pinn > 0.25
-                or (goal_align_pinn > 0.85 and value_pinn + 0.25 < value_rsa)
+                or (goal_align_pinn > 0.85 and gate_value_pinn + 0.06 < gate_value_rsa)
             )
         )
         if gate_release:
             use_rsa = False
             rsa_exit_cooldown = max(rsa_exit_cooldown, 10)
-        hard_exit = bool(exit_conf > 0.75 and sdf_curr > 0.2)
+        hard_exit = bool(
+            pinn_release_ready
+            and exit_conf > 0.82
+            and sdf_curr > 0.2
+            and d_path < 0.06
+            and pinn_monotonicity > 0.55
+        )
         if hard_exit:
             use_rsa = False
             rsa_exit_cooldown = max(rsa_exit_cooldown, 10)
@@ -630,12 +880,19 @@ def integrate_path_by_grad(
                 rsa_exit_cooldown = 0
             else:
                 use_rsa = False
-        soft_exit = bool(sdf_pinn > 0.25 and goal_align_pinn > 0.9)
+        soft_exit = bool(
+            pinn_release_ready
+            and sdf_pinn > 0.25
+            and goal_align_pinn > 0.9
+            and pinn_monotonicity > 0.55
+        )
         if obstacle_count <= 3 and rsa_streak >= 6 and sdf_curr > 0.18 and goal_align > 0.75 and d_path < 0.06:
-            soft_exit = True
+            soft_exit = bool(pinn_release_ready)
         if obstacle_count <= 3 and rsa_streak >= 4 and stall_steps == 0 and blockage < 0.12 and sdf_curr > 0.18 and goal_align > 0.65 and d_path < 0.08:
-            soft_exit = True
+            soft_exit = bool(pinn_release_ready)
         if use_rsa and ok_pinn and soft_exit:
+            use_rsa = False
+        if near_goal_anchor and ok_pinn and (goal_align_pinn > 0.80 or pinn_monotonicity > 0.55):
             use_rsa = False
 
         if use_rsa:
@@ -660,8 +917,11 @@ def integrate_path_by_grad(
             print(
                 f"[VDM] step={step} choose={'rsa' if use_rsa else 'pinn'} "
                 f"value_pinn={value_pinn:.3f} value_rsa={value_rsa:.3f} "
+                f"gate_pinn={gate_value_pinn:.3f} gate_rsa={gate_value_rsa:.3f} "
                 f"exit={exit_conf:.3f} sdf={sdf_curr:.3f} d_path={d_path:.3f} "
                 f"factor={current_factor:.2f} cooldown={rsa_exit_cooldown} "
+                f"mono={pinn_monotonicity:.3f} rel={pinn_release_metric:.3f} conf={pinn_confidence_counter} "
+                f"anchor={int(near_goal_anchor)} probe={int(entry_autonomy_probe)} "
                 f"gate={int(gate_entry_protect)}/{int(gate_release)}"
             )
 
@@ -727,6 +987,10 @@ class EvalMetrics:
     grad_norm_start: Optional[float] = None
     converge_steps: Optional[int] = None
     train_steps: Optional[int] = None
+    time_cost: float = 0.0
+    efficiency_ratio: float = 1.0
+    physical_consistency: float = 0.0
+    curvature_sharpness: float = 0.0
 
 
 def evaluate_methods(
@@ -746,6 +1010,8 @@ def evaluate_methods(
     ref_path = rsa_ref.backtrack_path_xy()
     ref_len = path_length(ref_path)
 
+    velocity_field_np_fn = env.velocity_field_np if env.has_velocity_field() else None
+
     metrics: Dict[str, EvalMetrics] = {}
     paths: Dict[str, np.ndarray] = {"rsa": rsa_low.backtrack_path_xy(), "ref": ref_path}
 
@@ -753,6 +1019,9 @@ def evaluate_methods(
     rsa_threshold = float(goal_tol) if bool(strict_goal_tol) else max(float(goal_tol), 0.17)
     rsa_ok = np.linalg.norm(rsa_path[-1] - np.asarray(goal_xy, dtype=np.float32)) <= rsa_threshold
     rsa_len = path_length(rsa_path)
+    rsa_time_cost = path_time_cost(rsa_path, velocity_field_np_fn)
+    rsa_eff = rsa_len / max(1e-12, rsa_time_cost)
+    _, rsa_curv_sharp, _ = path_curvature(rsa_path)
     metrics["rsa"] = EvalMetrics(
         success=bool(rsa_ok),
         length=rsa_len,
@@ -760,6 +1029,9 @@ def evaluate_methods(
         optimality_gap=(rsa_len - ref_len) / (ref_len + 1e-12),
         regret=(rsa_len - ref_len),
         grad_norm_start=None,
+        time_cost=rsa_time_cost,
+        efficiency_ratio=rsa_eff,
+        curvature_sharpness=rsa_curv_sharp,
     )
 
     for name, model in models.items():
@@ -774,11 +1046,16 @@ def evaluate_methods(
             rsa_field=rsa_ref,
             rsa_path_xy=ref_path,
             strict_goal_tol=strict_goal_tol,
-            use_gating=(name != "vanilla_pinn"),
+            use_gating=(name == "rhp_pinn"),
+            use_pure_rollout_stabilizer=(name == "pntfield_2d"),
         )
         paths[name] = path
         l = path_length(path)
         regret = l - ref_len
+        l_time_cost = path_time_cost(path, velocity_field_np_fn)
+        eff_ratio = l / max(1e-12, l_time_cost)
+        phys_cons = path_eikonal_residual(path, model, env)
+        _, curv_sharp, _ = path_curvature(path)
         gating_efficiency = regret / max(1e-12, gating_ratio) if np.isfinite(gating_ratio) else None
         metrics[name] = EvalMetrics(
             success=bool(ok),
@@ -794,6 +1071,10 @@ def evaluate_methods(
                 radius=grad_probe_radius,
                 num_points=grad_probe_points,
             ),
+            time_cost=l_time_cost,
+            efficiency_ratio=eff_ratio,
+            physical_consistency=phys_cons,
+            curvature_sharpness=curv_sharp,
         )
 
     return metrics, paths

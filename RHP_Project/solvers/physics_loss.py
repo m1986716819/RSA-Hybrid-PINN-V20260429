@@ -5,6 +5,10 @@ from typing import Callable, Tuple
 import torch
 
 
+def _safe_speed(speed: torch.Tensor, min_speed: float, max_speed: float = 1.0) -> torch.Tensor:
+    return torch.clamp(speed, min=float(min_speed), max=float(max_speed))
+
+
 def eikonal_residual(
     model: torch.nn.Module,
     xy: torch.Tensor,
@@ -25,9 +29,9 @@ def eikonal_residual(
     )[0]
     grad_norm = torch.sqrt(torch.sum(grad**2, dim=-1) + grad_eps)
 
-    f = speed_fn(xy).detach()
+    f = _safe_speed(speed_fn(xy).detach(), min_speed=max(float(speed_eps), 1e-3), max_speed=1.0)
     mask = (f > 0.0).to(dtype=xy.dtype)
-    inv_f = 1.0 / torch.clamp(f, min=speed_eps)
+    inv_f = 1.0 / f
     res = grad_norm - inv_f
     return res, mask
 
@@ -70,9 +74,9 @@ def upwind_physics_loss(
     ay = torch.maximum(torch.relu(dmy), torch.relu(-dpy)) ** 2
     grad_up = torch.sqrt(ax + ay + 1e-12)
 
-    f = speed_fn(xy).detach()
+    f = _safe_speed(speed_fn(xy).detach(), min_speed=max(float(speed_eps), 1e-3), max_speed=1.0)
     mask = (f > 0.0).to(dtype=xy.dtype)
-    inv_f = 1.0 / torch.clamp(f, min=float(speed_eps))
+    inv_f = 1.0 / f
     res = grad_up - inv_f
     return torch.mean((res**2) * mask)
 
@@ -128,7 +132,9 @@ def obstacle_loss(
             only_inputs=True,
         )[0]
         grad_norm = torch.sqrt(torch.sum(grad**2, dim=-1) + 1e-12)
-        inv_f = (1.0 / torch.clamp(speed_fn(xy).detach(), min=float(speed_eps))).to(dtype=xy.dtype)
+        inv_f = (1.0 / _safe_speed(speed_fn(xy).detach(), min_speed=max(float(speed_eps), 1e-3), max_speed=1.0)).to(
+            dtype=xy.dtype
+        )
         penalty = torch.relu(inv_f - grad_norm) ** 2
         loss_edge = torch.mean(edge * penalty)
     else:

@@ -2,15 +2,15 @@ seed: 0
 device: cpu
 
 env:
-  name: u_maze
+  name: trap_u_shape
   bounds:
-    x_min: -1.0
-    x_max: 1.0
-    y_min: -1.0
-    y_max: 1.0
-  start: [-0.8, -0.8]
-  goal: [0.8, 0.8]
-  obstacle_inflation: 0.01
+    x_min: -0.05
+    x_max: 1.05
+    y_min: -0.10
+    y_max: 1.10
+  start: [0.1, 0.5]
+  goal: [0.9, 0.5]
+  obstacle_inflation: 0.005
   u_maze:
     wall_thickness: 0.14
     inner_gap: 0.55
@@ -21,15 +21,23 @@ env:
     passage_width: 0.12
     block_width: 0.9
     block_height: 0.35
+    center: [0.0, 0.0]
+    rotation_deg: 0.0
+  trap_u_shape:
+    wall_thickness: 0.03
+    left_x: 0.35
+    u_depth: 0.28
+    u_height: 0.55
+    center_y: 0.5
 
 rsa:
   grid_size: [80, 80]
   connectivity: 8
   speed_free: 1.0
-  speed_obstacle: 0.0
+  speed_obstacle: 0.01
 
 train:
-  max_steps: 2500
+  max_steps: 3000
   warmup_steps: 500
   batch_size: 2048
   lr: 1.0e-3
@@ -41,6 +49,10 @@ train:
   lambda_goal: 5.0
   sdf_surface_band: 0.05
   sdf_surface_boost: 0.5
+  curriculum:
+    phys_ramp_start: 0.3
+    phys_ramp_end: 0.7
+    phys_hold: 2.0
   physics:
     mode: upwind
     fd_step: 0.01
@@ -109,10 +121,10 @@ model:
 
 eval:
   path_step: 0.02
-  max_path_steps: 400
+  max_path_steps: 600
   goal_tol: 0.05
   grad_probe_radius: 0.03
   grad_probe_points: 256
   reference_grid_size: [220, 220]
   save_plots: true
-  out_dir: outputs
+  out_dir: outputs_trap

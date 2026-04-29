@@ -17,7 +17,7 @@ from matplotlib import pyplot as plt
 
 from .envs.maze_2d import Bounds2D, Maze2DEnv
 from .evaluator.metrics import EvalMetrics, evaluate_methods
-from .main_bench import _gate_boost_weight, _grid_coords, _set_seed, _train_rhp, _train_vanilla_pinn
+from .main_bench import _gate_boost_weight, _grid_coords, _set_seed, _train_pntfield_2d, _train_rhp, _train_vanilla_pinn
 from .solvers.rsa_engine import RSAEngine, extract_gateway_segment
 from .utils.sampler import apply_sdf_surface_boost
 
@@ -189,7 +189,7 @@ def _evalmetrics_to_dict(m: EvalMetrics) -> Dict[str, Any]:
 
 
 def _aggregate_rollouts(rollouts: List[Dict[str, Any]]) -> Dict[str, Any]:
-    methods = ["rsa", "vanilla_pinn", "rhp_pinn"]
+    methods = ["rsa", "vanilla_pinn", "pntfield_2d", "rhp_pinn"]
     out: Dict[str, Any] = {}
     for name in methods:
         out[name] = {}
@@ -247,7 +247,7 @@ def _failure_reason(seed_result: Dict[str, Any], max_path_len: float) -> str:
 
 def _group_summary(seed_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     groups = ["classic", "random", "rubble", "overall"]
-    methods = ["rsa", "vanilla_pinn", "rhp_pinn"]
+    methods = ["rsa", "vanilla_pinn", "pntfield_2d", "rhp_pinn"]
     metric_keys = ["success_mean", "optimality_gap_mean", "gating_ratio_mean", "safety_margin_mean"]
     out: Dict[str, Any] = {}
     for group in groups:
@@ -292,8 +292,8 @@ def _draw_env(ax, env: Maze2DEnv) -> None:
 
 
 def _save_performance_matrix(out_path: Path, summary: Dict[str, Any]) -> None:
-    methods = ["vanilla_pinn", "rsa", "rhp_pinn"]
-    labels = ["Vanilla PINN", "RSA", "RHP-PINN"]
+    methods = ["vanilla_pinn", "pntfield_2d", "rsa", "rhp_pinn"]
+    labels = ["Vanilla PINN", "P-NTFields-2D", "RSA", "RHP-PINN"]
     metrics = [("success", "SR"), ("optimality_gap", "Gap"), ("gating_ratio", "Ratio")]
     colors = ["#C44E52", "#55A868", "#4C72B0"]
     fig, axes = plt.subplots(1, 3, figsize=(13.0, 4.2), constrained_layout=True)
@@ -341,7 +341,12 @@ def _save_markdown_summary(out_path: Path, summary: Dict[str, Any], seed_results
     lines.append("")
     lines.append("| Method | SR mean±std | Gap mean±std | Ratio mean±std | Safety mean±std |")
     lines.append("|---|---:|---:|---:|---:|")
-    for method, title in [("vanilla_pinn", "Vanilla PINN"), ("rsa", "RSA"), ("rhp_pinn", "RHP-PINN")]:
+    for method, title in [
+        ("vanilla_pinn", "Vanilla PINN"),
+        ("pntfield_2d", "P-NTFields-2D"),
+        ("rsa", "RSA"),
+        ("rhp_pinn", "RHP-PINN"),
+    ]:
         sr = summary["overall"][method]["success"]
         gap = summary["overall"][method]["optimality_gap"]
         ratio = summary["overall"][method]["gating_ratio"]
@@ -371,7 +376,12 @@ def _save_markdown_summary(out_path: Path, summary: Dict[str, Any], seed_results
         lines.append("")
         lines.append("| Method | SR | Gap | Ratio | Safety |")
         lines.append("|---|---:|---:|---:|---:|")
-        for method, title in [("vanilla_pinn", "Vanilla PINN"), ("rsa", "RSA"), ("rhp_pinn", "RHP-PINN")]:
+        for method, title in [
+            ("vanilla_pinn", "Vanilla PINN"),
+            ("pntfield_2d", "P-NTFields-2D"),
+            ("rsa", "RSA"),
+            ("rhp_pinn", "RHP-PINN"),
+        ]:
             sr = summary[group][method]["success"]["mean"]
             gap = summary[group][method]["optimality_gap"]["mean"]
             ratio = summary[group][method]["gating_ratio"]["mean"]
@@ -455,7 +465,15 @@ def _run_single_seed(cfg: Dict[str, Any], scenario: ScenarioSpec, device: torch.
         boost=float(cfg_s["train"].get("gate", {}).get("weight_boost", 2.0)),
     )
 
-    vanilla, vanilla_conv, vanilla_steps = _train_vanilla_pinn(env, start_xy, cfg_s, rng, device=device)
+    vanilla, vanilla_conv, vanilla_steps = _train_vanilla_pinn(env, start_xy, goal_xy, cfg_s, rng, device=device)
+    pntfield, pntfield_conv, pntfield_steps = _train_pntfield_2d(
+        env,
+        start_xy,
+        goal_xy,
+        cfg_s,
+        rng,
+        device=device,
+    )
     rhp, rhp_conv, rhp_steps = _train_rhp(
         env,
         start_xy,
@@ -473,7 +491,7 @@ def _run_single_seed(cfg: Dict[str, Any], scenario: ScenarioSpec, device: torch.
         device,
     )
 
-    models = {"vanilla_pinn": vanilla, "rhp_pinn": rhp}
+    models = {"vanilla_pinn": vanilla, "pntfield_2d": pntfield, "rhp_pinn": rhp}
     rollouts: List[Dict[str, Any]] = []
     for _ in range(3):
         metrics, paths = evaluate_methods(
@@ -501,6 +519,26 @@ def _run_single_seed(cfg: Dict[str, Any], scenario: ScenarioSpec, device: torch.
             grad_norm_start=metrics["vanilla_pinn"].grad_norm_start,
             converge_steps=int(vanilla_conv),
             train_steps=int(vanilla_steps),
+            time_cost=metrics["vanilla_pinn"].time_cost,
+            efficiency_ratio=metrics["vanilla_pinn"].efficiency_ratio,
+            physical_consistency=metrics["vanilla_pinn"].physical_consistency,
+            curvature_sharpness=metrics["vanilla_pinn"].curvature_sharpness,
+        )
+        metrics["pntfield_2d"] = EvalMetrics(
+            success=metrics["pntfield_2d"].success,
+            length=metrics["pntfield_2d"].length,
+            smoothness=metrics["pntfield_2d"].smoothness,
+            optimality_gap=metrics["pntfield_2d"].optimality_gap,
+            regret=metrics["pntfield_2d"].regret,
+            gating_ratio=metrics["pntfield_2d"].gating_ratio,
+            gating_efficiency=metrics["pntfield_2d"].gating_efficiency,
+            grad_norm_start=metrics["pntfield_2d"].grad_norm_start,
+            converge_steps=int(pntfield_conv),
+            train_steps=int(pntfield_steps),
+            time_cost=metrics["pntfield_2d"].time_cost,
+            efficiency_ratio=metrics["pntfield_2d"].efficiency_ratio,
+            physical_consistency=metrics["pntfield_2d"].physical_consistency,
+            curvature_sharpness=metrics["pntfield_2d"].curvature_sharpness,
         )
         metrics["rhp_pinn"] = EvalMetrics(
             success=metrics["rhp_pinn"].success,
@@ -513,8 +551,16 @@ def _run_single_seed(cfg: Dict[str, Any], scenario: ScenarioSpec, device: torch.
             grad_norm_start=metrics["rhp_pinn"].grad_norm_start,
             converge_steps=int(rhp_conv),
             train_steps=int(rhp_steps),
+            time_cost=metrics["rhp_pinn"].time_cost,
+            efficiency_ratio=metrics["rhp_pinn"].efficiency_ratio,
+            physical_consistency=metrics["rhp_pinn"].physical_consistency,
+            curvature_sharpness=metrics["rhp_pinn"].curvature_sharpness,
         )
-        safety = {name: _sdf_stats_for_path(env, path) for name, path in paths.items() if name in {"rsa", "vanilla_pinn", "rhp_pinn"}}
+        safety = {
+            name: _sdf_stats_for_path(env, path)
+            for name, path in paths.items()
+            if name in {"rsa", "vanilla_pinn", "pntfield_2d", "rhp_pinn"}
+        }
         rollouts.append(
             {
                 "metrics": {name: _evalmetrics_to_dict(m) for name, m in metrics.items()},

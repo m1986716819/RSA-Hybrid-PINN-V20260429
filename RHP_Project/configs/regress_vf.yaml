@@ -1,15 +1,16 @@
 seed: 0
 device: cpu
+num_seeds: 2
 
 env:
-  name: u_maze
+  name: narrow_passage
   bounds:
     x_min: -1.0
     x_max: 1.0
     y_min: -1.0
     y_max: 1.0
-  start: [-0.8, -0.8]
-  goal: [0.8, 0.8]
+  start: [-0.8, 0.0]
+  goal: [0.8, 0.0]
   obstacle_inflation: 0.01
   u_maze:
     wall_thickness: 0.14
@@ -21,6 +22,14 @@ env:
     passage_width: 0.12
     block_width: 0.9
     block_height: 0.35
+    center: [0.0, 0.0]
+    rotation_deg: 0.0
+  velocity_field:
+    enabled: true
+    type: half_space
+    v_upper: 1.0
+    v_lower: 0.2
+    boundary_y: 0.0
 
 rsa:
   grid_size: [80, 80]
@@ -115,4 +124,4 @@ eval:
   grad_probe_points: 256
   reference_grid_size: [220, 220]
   save_plots: true
-  out_dir: outputs
+  out_dir: outputs_regress_vf

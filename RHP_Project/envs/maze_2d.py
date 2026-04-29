@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Literal, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
@@ -77,6 +77,7 @@ class Maze2DEnv:
         self.speed_free = float(speed_free)
         self.speed_obstacle = float(speed_obstacle)
         self.device = torch.device(device)
+        self._velocity_field_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 
     @staticmethod
     def make_u_maze(
@@ -166,6 +167,118 @@ class Maze2DEnv:
         )
 
     @staticmethod
+    def make_trap_u_shape(
+        bounds: Bounds2D,
+        wall_thickness: float = 0.03,
+        left_x: float = 0.35,
+        u_depth: float = 0.28,
+        u_height: float = 0.55,
+        center_y: float = 0.5,
+        obstacle_inflation: float = 0.0,
+        speed_free: float = 1.0,
+        speed_obstacle: float = 0.01,
+        device: torch.device | str = "cpu",
+    ) -> "Maze2DEnv":
+        return Maze2DEnv._build_u_trap(
+            bounds=bounds,
+            wall_thickness=wall_thickness,
+            left_x=left_x,
+            u_depth=u_depth,
+            u_height=u_height,
+            center_y=center_y,
+            obstacle_inflation=obstacle_inflation,
+            speed_free=speed_free,
+            speed_obstacle=speed_obstacle,
+            device=device,
+        )
+
+    @staticmethod
+    def _build_u_trap(
+        bounds: Bounds2D,
+        wall_thickness: float,
+        left_x: float,
+        u_depth: float,
+        u_height: float,
+        center_y: float,
+        obstacle_inflation: float = 0.0,
+        speed_free: float = 1.0,
+        speed_obstacle: float = 0.01,
+        device: torch.device | str = "cpu",
+    ) -> "Maze2DEnv":
+        lx = float(left_x)
+        hw = float(wall_thickness) * 0.5
+        hh = float(u_height) * 0.5
+        cy = float(center_y)
+        top_y = cy - hh
+        bot_y = cy + hh
+        arm_center_x = lx + float(u_depth) * 0.5
+        arm_hw = float(u_depth) * 0.5 + hw
+
+        back_wall = dict(kind="box", center=(lx, cy), half_size=(hw, hh))
+        top_arm = dict(kind="box", center=(arm_center_x, top_y), half_size=(arm_hw, hw))
+        bottom_arm = dict(kind="box", center=(arm_center_x, bot_y), half_size=(arm_hw, hw))
+
+        return Maze2DEnv(
+            bounds=bounds,
+            obstacles=[back_wall, top_arm, bottom_arm],
+            obstacle_inflation=obstacle_inflation,
+            speed_free=speed_free,
+            speed_obstacle=speed_obstacle,
+            device=device,
+        )
+
+    @staticmethod
+    def make_trap_heterogeneous_vf(
+        bounds: Bounds2D,
+        wall_thickness: float = 0.03,
+        left_x: float = 0.35,
+        u_depth: float = 0.28,
+        u_height: float = 0.55,
+        center_y: float = 0.5,
+        v_slow: float = 0.3,
+        v_fast: float = 1.0,
+        sigmoid_beta: float = 8.0,
+        obstacle_inflation: float = 0.0,
+        speed_free: float = 1.0,
+        speed_obstacle: float = 0.01,
+        device: torch.device | str = "cpu",
+    ) -> "Maze2DEnv":
+        env = Maze2DEnv._build_u_trap(
+            bounds=bounds,
+            wall_thickness=wall_thickness,
+            left_x=left_x,
+            u_depth=u_depth,
+            u_height=u_height,
+            center_y=center_y,
+            obstacle_inflation=obstacle_inflation,
+            speed_free=speed_free,
+            speed_obstacle=speed_obstacle,
+            device=device,
+        )
+        lx = float(left_x)
+        hw = float(wall_thickness) * 0.5
+        ud = float(u_depth)
+        hh = float(u_height) * 0.5
+        cy = float(center_y)
+        interior_cx = lx + ud * 0.5
+        interior_cy = cy
+        interior_hx = ud * 0.5
+        interior_hy = hh - hw
+        beta = float(sigmoid_beta)
+
+        def _hetero_field(xy: torch.Tensor) -> torch.Tensor:
+            p = xy - torch.tensor([interior_cx, interior_cy], dtype=xy.dtype, device=xy.device).view(1, 2)
+            q = torch.abs(p) - torch.tensor([interior_hx, interior_hy], dtype=xy.dtype, device=xy.device).view(1, 2)
+            outside = torch.linalg.norm(torch.clamp(q, min=0.0), dim=-1)
+            inside = torch.clamp(torch.max(q, dim=-1).values, max=0.0)
+            sdf_interior = outside + inside
+            alpha = torch.sigmoid(-sdf_interior * beta)
+            return float(v_slow) * alpha + float(v_fast) * (1.0 - alpha)
+
+        env.set_velocity_field(_hetero_field)
+        return env
+
+    @staticmethod
     def make_obstacle_field(
         bounds: Bounds2D,
         obstacles: List[Dict],
@@ -177,6 +290,23 @@ class Maze2DEnv:
         return Maze2DEnv(
             bounds=bounds,
             obstacles=list(obstacles),
+            obstacle_inflation=obstacle_inflation,
+            speed_free=speed_free,
+            speed_obstacle=speed_obstacle,
+            device=device,
+        )
+
+    @staticmethod
+    def make_open_space(
+        bounds: Bounds2D,
+        obstacle_inflation: float = 0.0,
+        speed_free: float = 1.0,
+        speed_obstacle: float = 0.0,
+        device: torch.device | str = "cpu",
+    ) -> "Maze2DEnv":
+        return Maze2DEnv(
+            bounds=bounds,
+            obstacles=[],
             obstacle_inflation=obstacle_inflation,
             speed_free=speed_free,
             speed_obstacle=speed_obstacle,
@@ -431,6 +561,36 @@ class Maze2DEnv:
         f = torch.where(free, torch.tensor(self.speed_free, device=self.device), f)
         return f
 
+    def set_velocity_field(self, fn: Optional[Callable[[torch.Tensor], torch.Tensor]]) -> None:
+        self._velocity_field_fn = fn
+
+    def has_velocity_field(self) -> bool:
+        return self._velocity_field_fn is not None
+
+    def velocity_field_at(self, xy: torch.Tensor) -> Optional[torch.Tensor]:
+        if self._velocity_field_fn is None:
+            return None
+        return self._velocity_field_fn(xy)
+
+    def wave_speed(self, xy: torch.Tensor) -> torch.Tensor:
+        free = self.is_free(xy)
+        if self._velocity_field_fn is None:
+            f = torch.full((xy.shape[0],), self.speed_obstacle, device=self.device, dtype=torch.float32)
+            f = torch.where(free, torch.tensor(self.speed_free, device=self.device), f)
+            return f
+        v = self._velocity_field_fn(xy)
+        f = torch.full((xy.shape[0],), self.speed_obstacle, device=self.device, dtype=torch.float32)
+        f = torch.where(free, v, f)
+        return f
+
+    def velocity_field_np(self, xy: np.ndarray) -> float:
+        if self._velocity_field_fn is None:
+            return float(self.speed_free)
+        xy_t = torch.from_numpy(xy.astype(np.float32).reshape(1, 2)).to(device=self.device)
+        with torch.no_grad():
+            v = self._velocity_field_fn(xy_t)
+        return float(v.detach().cpu().numpy()[0])
+
     def make_grid(self, grid_size: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         h, w = int(grid_size[0]), int(grid_size[1])
         xs = np.linspace(self.bounds.x_min, self.bounds.x_max, w, dtype=np.float32)
@@ -447,6 +607,19 @@ class Maze2DEnv:
         f = np.full_like(sdf_vals, self.speed_obstacle, dtype=np.float32)
         f[free] = self.speed_free
         return f
+
+    def velocity_grid(self, grid_size: Tuple[int, int]) -> Optional[np.ndarray]:
+        if self._velocity_field_fn is None:
+            return None
+        xs, ys, sdf_vals = self.make_grid(grid_size)
+        free = sdf_vals > 0.0
+        xx, yy = np.meshgrid(xs, ys)
+        xy = np.stack([xx.reshape(-1), yy.reshape(-1)], axis=-1).astype(np.float32)
+        with torch.no_grad():
+            v = self._velocity_field_fn(torch.from_numpy(xy).to(device=self.device))
+        v_grid = v.detach().cpu().numpy().reshape(sdf_vals.shape)
+        v_grid = np.where(free, v_grid, 0.0)
+        return v_grid.astype(np.float32)
 
     def sample_uniform(
         self,
