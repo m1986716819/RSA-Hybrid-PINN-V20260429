@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Environments
+.env
+.venv
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# PyTorch / checkpoints (all weights excluded from version control)
+*.pth
+
+# Experiment intermediate outputs
+outputs_*/    # covers outputs_trap/, outputs_hetero_trap/, outputs_ablation_test*/
+test_result/
+reports/
+summary_report.md
+
+# Legacy experiment results (pre-v2)
+experiments/legacy_*
+
+# Results (auto-generated, not committed)
+experiments/
+
+# Benchmark outputs
+benchmark_results/
+
+# Paper figures (generated, not source)
+paper_figures/
+
+# Intermediate checkpoints (not needed for reproduction)
+checkpoints/pinn_costpit_*.pth
+checkpoints/phase1_*.pth
+checkpoints/phase2_*.pth
+
+# Temp scripts
+tmp_*.py
+tmp_*.yaml

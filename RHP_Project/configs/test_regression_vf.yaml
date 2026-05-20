@@ -1,0 +1,127 @@
+seed: 0
+device: cuda
+num_seeds: 3
+
+env:
+  name: narrow_passage
+  bounds:
+    x_min: -1.0
+    x_max: 1.0
+    y_min: -1.0
+    y_max: 1.0
+  start: [-0.8, 0.0]
+  goal: [0.8, 0.0]
+  obstacle_inflation: 0.01
+  u_maze:
+    wall_thickness: 0.14
+    inner_gap: 0.55
+    depth: 0.85
+    center: [0.0, 0.0]
+    rotation_deg: 0.0
+  narrow_passage:
+    passage_width: 0.12
+    block_width: 0.9
+    block_height: 0.35
+    center: [0.0, 0.0]
+    rotation_deg: 0.0
+  velocity_field:
+    enabled: true
+    type: half_space
+    v_upper: 1.0
+    v_lower: 0.2
+    boundary_y: 0.0
+
+rsa:
+  grid_size: [80, 80]
+  connectivity: 8
+  speed_free: 1.0
+  speed_obstacle: 0.0
+
+train:
+  max_steps: 2500
+  warmup_steps: 500
+  batch_size: 2048
+  lr: 1.0e-3
+  lambda_sup: 1.0
+  lambda_phys: 1.0
+  lambda_phys_start: 0.1
+  lambda_bc: 5.0
+  lambda_obs: 1.0
+  lambda_goal: 5.0
+  sdf_surface_band: 0.05
+  sdf_surface_boost: 0.5
+  physics:
+    mode: upwind
+    fd_step: 0.01
+  obstacle:
+    sdf_band: 0.05
+    lambda_int: 100.0
+    lambda_grad: 10.0
+    lambda_dir: 50.0
+    lambda_vort: 20.0
+    sdf_scale: 10.0
+  path_anchor:
+    lambda_path: 20.0
+    lambda_dir: 10.0
+    lambda_mono: 20.0
+    radius: 0.05
+    batch_size: 512
+  gate:
+    sdf_band: 0.03
+    segment_len: 16
+    sdf_weight: 1.0
+    diff_weight: 1.0
+    radius: 0.07
+    batch_size: 512
+    lambda_rsa_dir: 0.0
+    weight_boost: 2.0
+  gate_forcing:
+    radius: 0.15
+    batch_size: 512
+    lambda_gate: 150.0
+  adaptive_sampling:
+    base_weight: 0.2
+    wavefront_power: 1.0
+    obstacle_band: 0.06
+  pntfield_2d:
+    lr: 8.0e-4
+    batch_size: 2048
+    warmup_steps: 500
+    lambda_goal: 10.0
+    lambda_phys: 1.0
+    lambda_phys_start: 0.05
+    lambda_obs: 1.5
+    lambda_obs_start: 0.5
+    lambda_visc_start: 2.0e-3
+    lambda_visc_end: 2.0e-4
+    lambda_geom_start: 1.0
+    lambda_geom_end: 0.1
+    lambda_dir_start: 0.0
+    lambda_dir_end: 0.0
+    local_frac: 0.15
+    start_radius: 0.18
+    goal_radius: 0.12
+    grad_clip_norm: 0.75
+
+model:
+  hidden_dim: 128
+  num_layers: 4
+  activation: tanh
+  dist_eps: 1.0e-6
+  pntfield_2d:
+    hidden_dim: 128
+    num_blocks: 4
+    fourier_dim: 32
+    fourier_scale: 6.0
+    activation: silu
+    positive_output: true
+
+eval:
+  path_step: 0.02
+  max_path_steps: 400
+  goal_tol: 0.05
+  grad_probe_radius: 0.03
+  grad_probe_points: 256
+  reference_grid_size: [220, 220]
+  save_plots: true
+  out_dir: outputs_test_vf
