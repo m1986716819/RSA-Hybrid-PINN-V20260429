@@ -41,8 +41,8 @@ experiments/
 # Benchmark outputs
 benchmark_results/
 
-# Paper figures (generated, not source)
-paper_figures/
+# Paper figures (only track source PDF/SVG)
+paper_figures/*.png
 
 # Intermediate checkpoints (not needed for reproduction)
 checkpoints/pinn_costpit_*.pth

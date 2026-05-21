@@ -139,7 +139,7 @@ def integrate_path_by_grad(
     coupling_model: Optional[torch.nn.Module] = None,
     default_alpha: float = 0.3,
     strict_goal_tol: bool = False,
-) -> Tuple[np.ndarray, bool, float]:
+) -> Tuple[np.ndarray, bool, float, np.ndarray]:
     """Roll out a path by following the model's gradient field.
 
     When rsa_path_xy and coupling_model are provided, the step direction is
@@ -415,10 +415,11 @@ def _make_result(
     pts: list,
     success: bool,
     alpha_accum: list,
-) -> Tuple[np.ndarray, bool, float]:
+) -> Tuple[np.ndarray, bool, float, np.ndarray]:
     path = np.asarray(pts, dtype=np.float32)
     mean_alpha = float(np.mean(alpha_accum)) if alpha_accum else float("nan")
-    return path, success, mean_alpha
+    alpha_arr = np.asarray(alpha_accum, dtype=np.float32) if alpha_accum else np.array([], dtype=np.float32)
+    return path, success, mean_alpha, alpha_arr
 
 
 # ---------------------------------------------------------------
@@ -500,7 +501,7 @@ def evaluate_methods(
 
     for name, model in models.items():
         use_coupling = coupling_model is not None and name in ("rhp_pinn",)
-        path, ok, mean_alpha = integrate_path_by_grad(
+        path, ok, mean_alpha, alpha_arr = integrate_path_by_grad(
             model=model,
             env=env,
             start_xy=start_xy,
@@ -536,5 +537,7 @@ def evaluate_methods(
             physical_consistency=phys,
             curvature_sharpness=curv_sharp,
         )
+        if use_coupling and alpha_arr.size > 0:
+            paths[f"{name}_alpha"] = alpha_arr
 
     return metrics, paths
