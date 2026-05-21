@@ -25,7 +25,7 @@ from RHP_Project.benchmark import BenchmarkRunner
 from RHP_Project.benchmark.datasets.topology_suite import TopologySuite
 from RHP_Project.benchmark.datasets.movingai_loader import MovingAILoader
 from RHP_Project.benchmark.planners import (
-    AStarPlanner, FMMPlanner,
+    AStarPlanner, DijkstraPlanner, FMMPlanner, RRTStarPlanner,
     RHPPINNPlanner, VanillaPINNPlanner, PNTFieldPlanner,
 )
 from RHP_Project.benchmark.visualization import BenchmarkPlotter
@@ -34,7 +34,9 @@ from RHP_Project.benchmark.visualization import BenchmarkPlotter
 def _build_planners(names: list, device: str, grid_size: tuple) -> list:
     registry = {
         "astar": lambda: AStarPlanner(),
+        "dijkstra": lambda: DijkstraPlanner(),
         "fmm": lambda: FMMPlanner(),
+        "rrt_star": lambda: RRTStarPlanner(),
         "rhp_pinn": lambda: RHPPINNPlanner(
             device=device, grid_size=grid_size, verbose=True,
         ),
